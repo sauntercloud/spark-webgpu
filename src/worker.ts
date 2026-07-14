@@ -19,11 +19,13 @@ import init_wasm, {
   bhatt_lod_extsplats,
   get_lod_tree_level,
 } from "spark-rs";
+import { directWGSLWorkerSortHandlers } from "./backends/webgpu/workerSort";
 import type { ExtResult, PackedResult, SplatEncoding } from "./defines";
 
 const rpcHandlers = {
   sortSplats16,
   sortSplats32,
+  ...directWGSLWorkerSortHandlers,
   loadPackedSplats,
   loadExtSplats,
   tinyLodPackedSplats,

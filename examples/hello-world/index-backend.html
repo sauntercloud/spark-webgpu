@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • Hello World Backend</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+    }
+
+    body.dragging {
+      cursor: grabbing;
+    }
+
+    #camera-panel {
+      position: fixed;
+      right: 12px;
+      bottom: 12px;
+      width: min(360px, calc(100vw - 24px));
+      padding: 10px;
+      border-radius: 6px;
+      background: rgb(0 0 0 / 68%);
+      color: #e8f0ff;
+      font: 12px/1.35 system-ui, sans-serif;
+      box-sizing: border-box;
+    }
+
+    #camera-panel.collapsed {
+      width: 150px;
+      padding: 8px 10px;
+    }
+
+    #camera-panel .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    #camera-panel.collapsed .panel-head {
+      margin-bottom: 0;
+    }
+
+    #camera-panel .panel-title {
+      font-weight: 600;
+      min-width: 0;
+    }
+
+    #camera-panel .panel-toggle {
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      flex: 0 0 auto;
+      line-height: 22px;
+    }
+
+    #camera-panel .row {
+      display: grid;
+      grid-template-columns: 54px repeat(3, minmax(0, 1fr));
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+
+    #camera-panel .row.render-row {
+      grid-template-columns: 92px minmax(0, 1fr) 70px;
+    }
+
+    #camera-panel .render-controls {
+      margin: 10px 0 8px;
+      padding-top: 8px;
+      border-top: 1px solid rgb(255 255 255 / 16%);
+    }
+
+    #camera-panel .section-title {
+      margin-bottom: 7px;
+      color: #a9bdd8;
+      font-weight: 600;
+    }
+
+    #camera-panel input {
+      min-width: 0;
+      height: 24px;
+      box-sizing: border-box;
+      border: 1px solid rgb(255 255 255 / 18%);
+      border-radius: 4px;
+      background: rgb(255 255 255 / 10%);
+      color: #fff;
+      padding: 2px 5px;
+      font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    #camera-panel input[type="range"] {
+      height: 24px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      accent-color: #7db7ff;
+    }
+
+    #camera-panel textarea {
+      width: 100%;
+      height: 58px;
+      box-sizing: border-box;
+      resize: vertical;
+      border: 1px solid rgb(255 255 255 / 18%);
+      border-radius: 4px;
+      background: rgb(255 255 255 / 10%);
+      color: #fff;
+      padding: 5px;
+      font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    #camera-panel .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    #camera-panel button {
+      height: 26px;
+      border: 1px solid rgb(255 255 255 / 20%);
+      border-radius: 4px;
+      background: rgb(255 255 255 / 12%);
+      color: #fff;
+      padding: 0 8px;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    #camera-panel button:hover {
+      background: rgb(255 255 255 / 20%);
+    }
+
+    #camera-panel .hint {
+      margin-top: 6px;
+      min-height: 16px;
+      color: #a9bdd8;
+    }
+
+    #camera-panel.collapsed .panel-body {
+      display: none;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="camera-panel">
+    <div class="panel-head">
+      <div class="panel-title">Camera</div>
+      <button id="cam-toggle" class="panel-toggle" type="button" aria-label="Toggle camera panel">-</button>
+    </div>
+    <div class="panel-body">
+      <div class="row">
+        <span>pos</span>
+        <input id="cam-pos-x" inputmode="decimal">
+        <input id="cam-pos-y" inputmode="decimal">
+        <input id="cam-pos-z" inputmode="decimal">
+      </div>
+      <div class="row">
+        <span>rot</span>
+        <input id="cam-rot-x" inputmode="decimal">
+        <input id="cam-rot-y" inputmode="decimal">
+        <input id="cam-rot-z" inputmode="decimal">
+      </div>
+      <div id="render-controls" class="render-controls" hidden></div>
+      <textarea id="cam-json" spellcheck="false"></textarea>
+      <div class="actions">
+        <button id="cam-apply" type="button">Apply</button>
+        <button id="cam-copy" type="button">Copy</button>
+        <button id="cam-paste" type="button">Paste</button>
+        <button id="cam-refresh" type="button">Refresh</button>
+      </div>
+      <div id="cam-message" class="hint"></div>
+    </div>
+  </div>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+        "@sparkjsdev/spark": "../../dist/spark.module.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import {
+      PackedSplats,
+      SplatMesh,
+      SparkRenderer,
+      createSparkWebGPUBackend,
+    } from "@sparkjsdev/spark";
+    import { getAssetFileURL } from "../js/get-asset-url.js";
+
+    const params = new URLSearchParams(window.location.search);
+    const backendKind = params.get("backend") === "webgpu" ? "webgpu" : "webgl2";
+    const debug = params.get("debug") === "1";
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const rendererContext = backendKind === "webgpu"
+      ? await createWebGPURendererContext()
+      : createWebGL2RendererContext(scene);
+    const renderer = rendererContext.renderer;
+    document.body.appendChild(renderer.domElement);
+    const webgpuRenderControls = {
+      minAlpha: readPositiveNumberParam("minAlpha") ?? 3 / 255,
+      alphaBias: readPositiveNumberParam("alphaBias") ?? 5,
+      alphaRadiusScale: readPositiveNumberParam("alphaRadiusScale") ?? 1,
+      blurAmount: readNumberParam("blurAmount") ?? 0,
+    };
+
+    const controls = createFlyControls(camera, renderer.domElement, {
+      damping: readPositiveNumberParam("damping") ?? 0.2,
+      lookSpeed: readPositiveNumberParam("lookSpeed") ?? 0.003,
+      moveSpeed: readPositiveNumberParam("moveSpeed") ?? 4,
+      verticalSpeed: readPositiveNumberParam("verticalSpeed") ?? 1.2,
+      boost: readPositiveNumberParam("boost") ?? 3,
+    });
+    const cameraPanel = createCameraPanel(camera, controls, rendererContext.spark);
+
+    window.addEventListener('resize', onWindowResize, false);
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      requestRender();
+    }
+
+    let model = null;
+    let loadSerial = 0;
+    let animationFrame = 0;
+    let keepRendering = false;
+    installLocalFileDrop();
+
+    const splatURL = await getAssetFileURL("butterfly.spz");
+    await loadModel({
+      label: splatURL,
+      create: () => backendKind === "webgpu"
+        ? createWebGPUSplat(rendererContext.backend, splatURL)
+        : createWebGL2Splat({ url: splatURL }),
+    });
+
+    function requestRender() {
+      if (animationFrame) {
+        return;
+      }
+      animationFrame = requestAnimationFrame(renderOnce);
+    }
+
+    function beginInteractiveRender() {
+      keepRendering = true;
+      requestRender();
+    }
+
+    function endInteractiveRender() {
+      keepRendering = false;
+      requestRender();
+    }
+
+    function renderOnce() {
+      animationFrame = 0;
+      const controlsChanged = controls.update();
+      if (backendKind === "webgpu") {
+        rendererContext.backend.render(scene, camera);
+      } else {
+        renderer.render(scene, camera);
+      }
+      cameraPanel.update();
+      if (keepRendering || controlsChanged || model?.sortPending) {
+        requestRender();
+      }
+    }
+
+    async function loadModel({ label, create }) {
+      const serial = ++loadSerial;
+      try {
+        const nextModel = await create();
+        await nextModel.initialized;
+        if (serial !== loadSerial) {
+          disposeModel(nextModel);
+          return;
+        }
+        replaceModel(nextModel);
+        frameModel(nextModel);
+        requestRender();
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
+    function replaceModel(nextModel) {
+      if (model) {
+        scene.remove(model);
+        disposeModel(model);
+      }
+      model = nextModel;
+      scene.add(model);
+      if (backendKind === "webgpu") {
+        model.setRenderOptions?.(webgpuRenderControls);
+      }
+    }
+
+    function disposeModel(disposedModel) {
+      disposedModel.dispose?.();
+      if (backendKind === "webgpu") {
+        disposedModel.packedSplats?.dispose?.();
+      }
+    }
+
+    function createCameraPanel(camera, controls, spark) {
+      const fields = {
+        panel: document.getElementById("camera-panel"),
+        toggle: document.getElementById("cam-toggle"),
+        px: document.getElementById("cam-pos-x"),
+        py: document.getElementById("cam-pos-y"),
+        pz: document.getElementById("cam-pos-z"),
+        rx: document.getElementById("cam-rot-x"),
+        ry: document.getElementById("cam-rot-y"),
+        rz: document.getElementById("cam-rot-z"),
+        renderControls: document.getElementById("render-controls"),
+        json: document.getElementById("cam-json"),
+        message: document.getElementById("cam-message"),
+      };
+      const renderFields = createRenderControlFields(fields.renderControls, spark);
+      const euler = new THREE.Euler(0, 0, 0, "YXZ");
+      let editing = false;
+      let messageTimer = 0;
+
+      fields.panel.addEventListener("pointerdown", (event) => {
+        event.stopPropagation();
+      });
+      fields.panel.addEventListener("pointermove", (event) => {
+        event.stopPropagation();
+      });
+      fields.toggle.addEventListener("click", () => {
+        fields.panel.classList.toggle("collapsed");
+        fields.toggle.textContent = fields.panel.classList.contains("collapsed") ? "+" : "-";
+      });
+
+      const inputs = [
+        fields.px,
+        fields.py,
+        fields.pz,
+        fields.rx,
+        fields.ry,
+        fields.rz,
+        ...renderFields.flatMap(({ slider, valueInput }) => [slider, valueInput]),
+        fields.json,
+      ];
+      for (const input of inputs) {
+        input.addEventListener("focus", () => {
+          editing = true;
+        });
+        input.addEventListener("blur", () => {
+          editing = inputs.some((field) => field === document.activeElement);
+        });
+      }
+
+      document.getElementById("cam-apply").addEventListener("click", () => {
+        applyFromFields();
+      });
+      document.getElementById("cam-refresh").addEventListener("click", () => {
+        update(true);
+      });
+      document.getElementById("cam-copy").addEventListener("click", async () => {
+        const text = cameraSnapshotText();
+        fields.json.value = text;
+        try {
+          await navigator.clipboard.writeText(text);
+          setMessage("copied");
+        } catch (error) {
+          setMessage("copy failed");
+          console.warn("Camera clipboard copy failed", error);
+        }
+      });
+      document.getElementById("cam-paste").addEventListener("click", async () => {
+        try {
+          fields.json.value = await navigator.clipboard.readText();
+          applyFromText(fields.json.value);
+          setMessage("pasted");
+        } catch (error) {
+          setMessage("paste failed");
+          console.warn("Camera clipboard paste failed", error);
+        }
+      });
+      function setMessage(message) {
+        fields.message.textContent = message;
+        clearTimeout(messageTimer);
+        messageTimer = setTimeout(() => {
+          fields.message.textContent = "";
+        }, 1800);
+      }
+
+      function numberValue(input) {
+        const value = Number(input.value);
+        if (!Number.isFinite(value)) {
+          throw new Error("Invalid camera number");
+        }
+        return value;
+      }
+
+      function cameraSnapshot() {
+        euler.setFromQuaternion(camera.quaternion, "YXZ");
+        return {
+          position: {
+            x: roundCameraNumber(camera.position.x),
+            y: roundCameraNumber(camera.position.y),
+            z: roundCameraNumber(camera.position.z),
+          },
+          rotation: {
+            x: roundCameraNumber(THREE.MathUtils.radToDeg(euler.x)),
+            y: roundCameraNumber(THREE.MathUtils.radToDeg(euler.y)),
+            z: roundCameraNumber(THREE.MathUtils.radToDeg(euler.z)),
+          },
+        };
+      }
+
+      function cameraSnapshotText() {
+        return JSON.stringify(cameraSnapshot());
+      }
+
+      function applyCameraSnapshot(snapshot) {
+        camera.position.set(
+          Number(snapshot.position.x),
+          Number(snapshot.position.y),
+          Number(snapshot.position.z),
+        );
+        euler.set(
+          THREE.MathUtils.degToRad(Number(snapshot.rotation.x)),
+          THREE.MathUtils.degToRad(Number(snapshot.rotation.y)),
+          THREE.MathUtils.degToRad(Number(snapshot.rotation.z)),
+          "YXZ",
+        );
+        camera.quaternion.setFromEuler(euler);
+        controls.syncFromCamera?.();
+        requestRender();
+        update(true);
+      }
+
+      function applyFromFields() {
+        try {
+          applyCameraSnapshot({
+            position: {
+              x: numberValue(fields.px),
+              y: numberValue(fields.py),
+              z: numberValue(fields.pz),
+            },
+            rotation: {
+              x: numberValue(fields.rx),
+              y: numberValue(fields.ry),
+              z: numberValue(fields.rz),
+            },
+          });
+          setMessage("applied");
+        } catch (error) {
+          setMessage("invalid input");
+        }
+      }
+
+      function applyFromText(text) {
+        const parsed = parseCameraText(text);
+        applyCameraSnapshot(parsed);
+      }
+
+      function update(force = false) {
+        if (editing && !force) {
+          return;
+        }
+        const snapshot = cameraSnapshot();
+        fields.px.value = formatCameraNumber(snapshot.position.x);
+        fields.py.value = formatCameraNumber(snapshot.position.y);
+        fields.pz.value = formatCameraNumber(snapshot.position.z);
+        fields.rx.value = formatCameraNumber(snapshot.rotation.x);
+        fields.ry.value = formatCameraNumber(snapshot.rotation.y);
+        fields.rz.value = formatCameraNumber(snapshot.rotation.z);
+        for (const field of renderFields) {
+          setRenderControlValue(field.slider, field.valueInput, field.getValue());
+        }
+        fields.json.value = cameraSnapshotText();
+      }
+
+      update(true);
+      return { update };
+    }
+
+    function createRenderControlFields(container, spark) {
+      if (!debug) {
+        return [];
+      }
+      container.hidden = false;
+      const title = document.createElement("div");
+      title.className = "section-title";
+      title.textContent = `Render (${backendKind})`;
+      container.appendChild(title);
+
+      const definitions = backendKind === "webgpu"
+        ? [
+            { key: "minAlpha", label: "minAlpha", min: 0, max: 0.08, step: 0.0005 },
+            { key: "alphaBias", label: "alphaBias", min: 0.01, max: 20, step: 0.1 },
+            { key: "alphaRadiusScale", label: "alphaRadius", min: 0.01, max: 2, step: 0.005 },
+            { key: "blurAmount", label: "blur", min: 0, max: 2, step: 0.01 },
+          ]
+        : [
+            { key: "minAlpha", label: "minAlpha", min: 0, max: 0.08, step: 0.0005 },
+            { key: "blurAmount", label: "blur", min: 0, max: 2, step: 0.01 },
+            { key: "preBlurAmount", label: "preBlur", min: 0, max: 2, step: 0.01 },
+            { key: "maxStdDev", label: "maxStdDev", min: 0.1, max: 4, step: 0.01 },
+            { key: "falloff", label: "falloff", min: 0, max: 1, step: 0.01 },
+            { key: "focalAdjustment", label: "focalAdjust", min: 0.1, max: 2, step: 0.01 },
+            { key: "focalDistance", label: "focalDist", min: 0, max: 100, step: 0.1 },
+            { key: "apertureAngle", label: "aperture", min: 0, max: 0.05, step: 0.0001 },
+            { key: "minPixelRadius", label: "minPixel", min: 0, max: 16, step: 0.1 },
+            { key: "maxPixelRadius", label: "maxPixel", min: 1, max: 1024, step: 1 },
+            { key: "clipXY", label: "clipXY", min: 1, max: 2, step: 0.01 },
+          ];
+
+      return definitions.map((definition) => {
+        const row = document.createElement("div");
+        row.className = "row render-row";
+        const label = document.createElement("span");
+        label.textContent = definition.label;
+        const slider = document.createElement("input");
+        slider.type = "range";
+        slider.min = String(definition.min);
+        slider.max = String(definition.max);
+        slider.step = String(definition.step);
+        const valueInput = document.createElement("input");
+        valueInput.inputMode = "decimal";
+        row.append(label, slider, valueInput);
+        container.appendChild(row);
+
+        const getValue = () => backendKind === "webgpu"
+          ? webgpuRenderControls[definition.key]
+          : spark[definition.key];
+        const apply = () => {
+          const value = Number(valueInput.value);
+          if (!Number.isFinite(value)) {
+            return;
+          }
+          const clamped = Math.min(definition.max, Math.max(definition.min, value));
+          if (backendKind === "webgpu") {
+            webgpuRenderControls[definition.key] = clamped;
+            model?.setRenderOptions?.(webgpuRenderControls);
+          } else {
+            spark[definition.key] = clamped;
+          }
+          setRenderControlValue(slider, valueInput, clamped);
+          requestRender();
+        };
+        bindRenderControl(slider, valueInput, apply);
+        setRenderControlValue(slider, valueInput, getValue());
+        return { slider, valueInput, getValue };
+      });
+    }
+
+    function parseCameraText(text) {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed?.position) && Array.isArray(parsed?.rotation)) {
+        return {
+          position: { x: parsed.position[0], y: parsed.position[1], z: parsed.position[2] },
+          rotation: { x: parsed.rotation[0], y: parsed.rotation[1], z: parsed.rotation[2] },
+        };
+      }
+      if (parsed?.position && parsed?.rotation) {
+        return parsed;
+      }
+      throw new Error("Invalid camera JSON");
+    }
+
+    function bindRenderControl(slider, valueInput, apply) {
+      slider.addEventListener("input", () => {
+        valueInput.value = slider.value;
+        apply();
+      });
+      slider.addEventListener("change", () => {
+        valueInput.value = slider.value;
+        apply();
+      });
+      valueInput.addEventListener("input", () => {
+        slider.value = valueInput.value;
+        apply();
+      });
+      valueInput.addEventListener("change", () => {
+        slider.value = valueInput.value;
+        apply();
+      });
+    }
+
+    function setRenderControlValue(slider, valueInput, value) {
+      const formatted = formatRenderNumber(value);
+      slider.value = String(value);
+      valueInput.value = formatted;
+    }
+
+    function roundCameraNumber(value) {
+      return Math.round(value * 1000000) / 1000000;
+    }
+
+    function formatCameraNumber(value) {
+      return Number(value).toFixed(4);
+    }
+
+    function formatRenderNumber(value) {
+      return Number(value).toPrecision(6);
+    }
+
+    function isEditableTarget(target) {
+      return target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        target?.isContentEditable;
+    }
+
+    function createFlyControls(camera, domElement, {
+      damping = 0.2,
+      lookSpeed = 0.003,
+      moveSpeed = 4,
+      verticalSpeed = 1.2,
+      boost = 3,
+    } = {}) {
+      const keys = new Set();
+      const velocity = new THREE.Vector3();
+      const move = new THREE.Vector3();
+      const forward = new THREE.Vector3();
+      const right = new THREE.Vector3();
+      const up = new THREE.Vector3(0, 1, 0);
+      const euler = new THREE.Euler(0, 0, 0, "YXZ");
+      let dragging = false;
+      let lastTime = performance.now();
+
+      function keyName(event) {
+        return event.key.length === 1 ? event.key.toLowerCase() : event.key;
+      }
+
+      function hasMovementInput() {
+        return keys.has("w") || keys.has("a") || keys.has("s") ||
+          keys.has("d") || keys.has("q") || keys.has("e");
+      }
+
+      function onKeyDown(event) {
+        if (isEditableTarget(event.target)) {
+          return;
+        }
+        const key = keyName(event);
+        if (["w", "a", "s", "d", "q", "e", "Shift"].includes(key)) {
+          event.preventDefault();
+          keys.add(key);
+          beginInteractiveRender();
+        }
+      }
+
+      function onKeyUp(event) {
+        if (isEditableTarget(event.target)) {
+          return;
+        }
+        const key = keyName(event);
+        keys.delete(key);
+        if (!hasMovementInput() && !dragging) {
+          endInteractiveRender();
+        }
+      }
+
+      function onPointerDown(event) {
+        if (event.button !== 0) {
+          return;
+        }
+        dragging = true;
+        domElement.setPointerCapture?.(event.pointerId);
+        document.body.classList.add("dragging");
+        beginInteractiveRender();
+      }
+
+      function onPointerMove(event) {
+        if (!dragging) {
+          return;
+        }
+        euler.setFromQuaternion(camera.quaternion);
+        euler.y -= event.movementX * lookSpeed;
+        euler.x -= event.movementY * lookSpeed;
+        euler.x = Math.max(-Math.PI / 2 + 0.001, Math.min(Math.PI / 2 - 0.001, euler.x));
+        camera.quaternion.setFromEuler(euler);
+        requestRender();
+      }
+
+      function onPointerUp(event) {
+        dragging = false;
+        domElement.releasePointerCapture?.(event.pointerId);
+        document.body.classList.remove("dragging");
+        if (!hasMovementInput()) {
+          endInteractiveRender();
+        }
+      }
+
+      window.addEventListener("keydown", onKeyDown);
+      window.addEventListener("keyup", onKeyUp);
+      domElement.addEventListener("pointerdown", onPointerDown);
+      domElement.addEventListener("pointermove", onPointerMove);
+      domElement.addEventListener("pointerup", onPointerUp);
+      domElement.addEventListener("pointercancel", onPointerUp);
+
+      return {
+        syncFromCamera() {
+          euler.setFromQuaternion(camera.quaternion, "YXZ");
+        },
+        update() {
+          const now = performance.now();
+          const dt = Math.min(0.05, (now - lastTime) / 1000);
+          lastTime = now;
+          move.set(0, 0, 0);
+          if (keys.has("w")) move.z -= 1;
+          if (keys.has("s")) move.z += 1;
+          if (keys.has("a")) move.x -= 1;
+          if (keys.has("d")) move.x += 1;
+          if (keys.has("q")) move.y -= 1;
+          if (keys.has("e")) move.y += 1;
+          if (move.lengthSq() > 0) {
+            move.normalize();
+            const speed = moveSpeed * (keys.has("Shift") ? boost : 1);
+            const ySpeed = verticalSpeed * (keys.has("Shift") ? boost : 1);
+            forward.set(0, 0, -1).applyQuaternion(camera.quaternion);
+            right.set(1, 0, 0).applyQuaternion(camera.quaternion);
+            velocity.addScaledVector(right, move.x * speed * dt);
+            velocity.addScaledVector(up, move.y * ySpeed * dt);
+            velocity.addScaledVector(forward, -move.z * speed * dt);
+          }
+          const moved = velocity.lengthSq() > 1e-10;
+          if (moved) {
+            camera.position.add(velocity);
+            velocity.multiplyScalar(Math.max(0, 1 - damping));
+            if (velocity.lengthSq() < 1e-8) {
+              velocity.set(0, 0, 0);
+            }
+          }
+          return moved || dragging;
+        },
+      };
+    }
+
+    async function createWebGPUSplat(backend, url) {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`${response.status} ${response.statusText} fetching ${url}`);
+      }
+      return createWebGPUSplatFromBytes(backend, await response.arrayBuffer(), url);
+    }
+
+    async function createWebGPUSplatFromBytes(backend, fileBytes, fileName) {
+      const packedSplats = new PackedSplats({
+        fileBytes,
+        fileName,
+      });
+      await packedSplats.initialized;
+      const gpuSortAlgorithmParam = params.get("gpuSortAlgorithm");
+      const gpuSortAlgorithm = gpuSortAlgorithmParam === "bitonic" || gpuSortAlgorithmParam === "radix" || gpuSortAlgorithmParam === "bucket" || gpuSortAlgorithmParam === "counting" ? gpuSortAlgorithmParam : "adaptive";
+      const gpuSortRadix = (gpuSortAlgorithm === "radix" || gpuSortAlgorithm === "bucket" || gpuSortAlgorithm === "counting" || gpuSortAlgorithm === "adaptive") &&
+        params.get("gpuSortRadix") !== "0" &&
+        params.get("gpuSortRadixUnsafe") !== "0";
+      return backend.createSplatMesh(packedSplats, {
+        sizeScale: readPositiveNumberParam("sizeScale") ?? 1,
+        blurAmount: webgpuRenderControls.blurAmount,
+        preBlurAmount: readNumberParam("preBlurAmount") ?? 0,
+        falloff: readNumberParam("falloff") ?? 1,
+        alphaBias: webgpuRenderControls.alphaBias,
+        alphaRadiusScale: webgpuRenderControls.alphaRadiusScale,
+        highPrecisionProjected: params.get("highPrecisionProjected") === "1",
+        minAlpha: webgpuRenderControls.minAlpha,
+        maxStdDev: readPositiveNumberParam("maxStdDev") ?? Math.sqrt(8),
+        sort: params.get("sort") !== "off",
+        sortRadial: params.get("sort") !== "z",
+        onDirty: requestRender,
+        renderSortedCamera: params.get("renderCamera") === "sorted",
+        sortGPU: backendKind === "webgpu",
+        gpuSortMaxSplats: readPositiveNumberParam("gpuSortMaxSplats") ?? (gpuSortAlgorithm === "radix" || gpuSortAlgorithm === "bucket" || gpuSortAlgorithm === "counting" || gpuSortAlgorithm === "adaptive" ? Number.MAX_SAFE_INTEGER : undefined),
+        gpuSortAlgorithm,
+        gpuSortBucketBits: readPositiveNumberParam("gpuSortBucketBits") ?? 16,
+        gpuSortBucketCount: readPositiveNumberParam("gpuSortBucketCount") ?? 131072,
+        gpuSortRadix,
+        gpuSortDebugOnce: params.get("gpuSortDebugOnce") === "1",
+        gpuSortTimestamp: params.get("gpuSortTimestamp") === "1",
+      });
+    }
+
+    function createWebGL2Splat({ url, fileBytes, fileName }) {
+      return new SplatMesh({ url, fileBytes, fileName });
+    }
+
+    function installLocalFileDrop() {
+      document.addEventListener("dragover", (event) => {
+        event.preventDefault();
+      });
+      document.addEventListener("drop", async (event) => {
+        event.preventDefault();
+        const file = event.dataTransfer?.files?.[0];
+        if (!file) {
+          return;
+        }
+        const fileBytes = await file.arrayBuffer();
+        await loadModel({
+          label: file.name,
+          create: () => backendKind === "webgpu"
+            ? createWebGPUSplatFromBytes(rendererContext.backend, fileBytes, file.name)
+            : createWebGL2Splat({ fileBytes, fileName: file.name }),
+        });
+      });
+    }
+
+    function createWebGL2RendererContext(scene) {
+      const renderer = new THREE.WebGLRenderer();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, Number(params.get("maxDpr") ?? window.devicePixelRatio)));
+      renderer.setClearColor(0x000000, 1);
+      const spark = new SparkRenderer({ renderer });
+      scene.add(spark);
+      return { backendKind: "webgl2", renderer, backend: null, spark };
+    }
+
+    async function createWebGPURendererContext() {
+      const backend = await createSparkWebGPUBackend();
+      const renderer = backend.renderer;
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, Number(params.get("maxDpr") ?? window.devicePixelRatio)));
+      renderer.setClearColor(0x000000, 1);
+      return { backendKind: "webgpu", renderer, backend, spark: null };
+    }
+
+    function readPositiveNumberParam(name) {
+      const value = Number(params.get(name));
+      return Number.isFinite(value) && value > 0 ? value : undefined;
+    }
+
+    function readNumberParam(name) {
+      const value = Number(params.get(name));
+      return Number.isFinite(value) ? value : undefined;
+    }
+
+    function frameModel(model) {
+      const bounds = estimateSplatBounds(model);
+      if (!bounds) {
+        model.position.set(0, 0, -3);
+        controls.syncFromCamera?.();
+        return "frame=fallback";
+      }
+      const center = bounds.min.clone().add(bounds.max).multiplyScalar(0.5);
+      const radius = Math.max(0.001, bounds.max.distanceTo(bounds.min) * 0.5);
+      const scale = 14 / radius;
+      model.scale.setScalar(scale);
+      model.position.copy(center.multiplyScalar(-scale));
+      model.position.z -= 20;
+      camera.position.set(0, 0, 20);
+      camera.near = 0.01;
+      camera.far = 10000;
+      camera.updateProjectionMatrix();
+      controls.syncFromCamera?.();
+      return `frame=r${radius.toFixed(2)} s${scale.toExponential(2)}`;
+    }
+
+    function estimateSplatBounds(model) {
+      const packedSplats = model?.packedSplats;
+      if (packedSplats?.forEachSplat) {
+        return estimatePackedBounds(packedSplats);
+      }
+      if (model?.getBoundingBox) {
+        const box = model.getBoundingBox(true);
+        if (Number.isFinite(box.min.x) && Number.isFinite(box.max.x)) {
+          return { min: box.min, max: box.max };
+        }
+      }
+      return null;
+    }
+
+    function estimatePackedBounds(packedSplats) {
+      const count = packedSplats.getNumSplats?.() ?? 0;
+      const stride = Math.max(1, Math.floor(count / 50000));
+      let sampled = 0;
+      const min = new THREE.Vector3(
+        Number.POSITIVE_INFINITY,
+        Number.POSITIVE_INFINITY,
+        Number.POSITIVE_INFINITY,
+      );
+      const max = new THREE.Vector3(
+        Number.NEGATIVE_INFINITY,
+        Number.NEGATIVE_INFINITY,
+        Number.NEGATIVE_INFINITY,
+      );
+      packedSplats.forEachSplat((index, center) => {
+        if (index % stride !== 0) {
+          return;
+        }
+        min.min(center);
+        max.max(center);
+        sampled++;
+      });
+      if (sampled === 0) {
+        return null;
+      }
+      return { min, max };
+    }
+  </script>
+</body>
+
+</html>
