@@ -106,6 +106,48 @@ Copy the following code into an `index.html` file.
 npm install @sparkjsdev/spark
 ```
 
+### WebGPU with automatic WebGL2 fallback
+
+Use the asynchronous SDK entry point when one application should support both
+rendering backends. `auto` tries WebGPU first and creates the original WebGL2
+`SparkRenderer` implementation when WebGPU initialization fails.
+
+```js
+import * as THREE from "three";
+import { createSparkRenderer } from "@sparkjsdev/spark";
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
+const spark = await createSparkRenderer({
+  backend: "auto", // "webgpu", "webgl2", or "auto"
+  onFallback: (error) => console.warn("Using WebGL2", error),
+});
+
+spark.setSize(innerWidth, innerHeight);
+spark.setPixelRatio(devicePixelRatio); // Clamped by the active device profile.
+document.body.appendChild(spark.renderer.domElement);
+
+const splat = await spark.createSplatMesh({
+  url: "https://sparkjs.dev/assets/splats/butterfly.spz",
+  webgpu: {
+    // Optional WebGPU-only overrides. Mobile/desktop defaults are automatic.
+    gpuSortMaxSplats: 2_000_000,
+  },
+});
+scene.add(splat);
+
+spark.renderer.setAnimationLoop(() => spark.render(scene, camera));
+```
+
+Setting `backend: "webgpu"` is strict and reports initialization errors instead
+of falling back. Setting `backend: "webgl2"` skips WebGPU detection. Existing
+`new SparkRenderer(...)` and `new SplatMesh(...)` code remains supported.
+`gpuSortMaxSplats` is a sorting budget rather than a loading limit; larger models
+remain renderable and automatically fall back to an asynchronous Worker radix
+sort while preserving back-to-front blending order.
+Counting sort never uses fewer than 65,536 depth buckets. If that precision is
+too expensive, Spark switches sorting backends instead of reducing visual quality.
+
 ## Run Examples locally
 
 Install [Rust](https://www.rust-lang.org/tools/install) if it's not already installed in your machine.

@@ -118,6 +118,7 @@ export interface SparkRendererOptions {
    * Scalar value to add to 2D splat covarianve diagonal, with opacity adjustment
    * to correctly account for "blurring" when anti-aliasing. Typically 0.3
    * (equivalent to approx 0.5 pixel radius) in scenes trained with anti-aliasing.
+   * @default 0.01
    */
   blurAmount?: number;
   /**
@@ -514,7 +515,7 @@ export class SparkRenderer extends THREE.Mesh {
     this.enable2DGS = options.enable2DGS ?? false;
     // this.enableRayEval = options.enableRayEval ?? false;
     this.preBlurAmount = options.preBlurAmount ?? 0.0;
-    this.blurAmount = options.blurAmount ?? 0.3;
+    this.blurAmount = options.blurAmount ?? 0.01;
     this.focalDistance = options.focalDistance ?? 0.0;
     this.apertureAngle = options.apertureAngle ?? 0.0;
     this.falloff = options.falloff ?? 1.0;
@@ -641,7 +642,7 @@ export class SparkRenderer extends THREE.Mesh {
       // Add to projected 2D splat covariance diagonal (thickens and brightens)
       preBlurAmount: { value: 0.0 },
       // Add to 2D splat covariance diagonal and adjust opacity (anti-aliasing)
-      blurAmount: { value: 0.3 },
+      blurAmount: { value: 0.01 },
       // Depth-of-field distance to focal plane
       focalDistance: { value: 0.0 },
       // Full-width angle of aperture opening (in radians)

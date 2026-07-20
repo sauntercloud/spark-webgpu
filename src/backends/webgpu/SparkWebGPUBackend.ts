@@ -1,7 +1,7 @@
 import type * as THREE from "three";
 import type WebGPURenderer from "three/src/renderers/webgpu/WebGPURenderer.js";
 import type { PackedSplats } from "../../PackedSplats";
-import { isWebGPUAvailable } from "./capabilities";
+import { getWebGPUCapabilityReport, isWebGPUAvailable } from "./capabilities";
 import { WebGPUWGSLSplatMesh } from "./wgslSplats";
 
 export type SparkWebGPURendererParameters = ConstructorParameters<
@@ -12,6 +12,7 @@ export class SparkWebGPUBackend {
   readonly kind = "webgpu";
   readonly renderer: WebGPURenderer;
   isReady = false;
+  deviceLostInfo: GPUDeviceLostInfo | null = null;
 
   private constructor({ renderer }: { renderer: WebGPURenderer }) {
     this.renderer = renderer;
@@ -28,12 +29,32 @@ export class SparkWebGPUBackend {
       );
     }
 
+    const capability = await getWebGPUCapabilityReport();
+    if (!capability.available) {
+      throw new Error(
+        "SparkRenderer WebGPU backend requested but no WebGPU adapter is available.",
+      );
+    }
+
     const { WebGPURenderer } = await import("three/webgpu");
     const renderer = new WebGPURenderer(parameters);
     await renderer.init();
 
+    const rendererBackend = renderer.backend as { device?: GPUDevice };
+    if (!rendererBackend.device) {
+      renderer.dispose();
+      throw new Error(
+        "SparkRenderer requires a native WebGPU device; WebGL fallback is unsupported.",
+      );
+    }
+
     const backend = new SparkWebGPUBackend({ renderer });
     backend.isReady = true;
+    void rendererBackend.device.lost.then((info) => {
+      backend.isReady = false;
+      backend.deviceLostInfo = info;
+      console.error(`SparkRenderer WebGPU device lost: ${info.message}`);
+    });
     return backend;
   }
 
@@ -45,21 +66,22 @@ export class SparkWebGPUBackend {
   }
 
   render(scene: THREE.Scene, camera: THREE.Camera) {
+    if (!this.isReady) return false;
     const directObjects: WebGPUWGSLSplatMesh[] = [];
     scene.traverse((object) => {
       if (object instanceof WebGPUWGSLSplatMesh) {
         directObjects.push(object);
       }
     });
-    if (directObjects.length > 0) {
-      directObjects.forEach((object, index) => {
-        object.renderWebGPUDirect(this.renderer, camera, {
-          clear: index === 0,
-        });
-      });
-      return true;
-    }
     this.renderer.render(scene, camera);
+    for (const object of directObjects) {
+      object.renderWebGPUDirect(this.renderer, camera, { clear: false });
+    }
     return true;
+  }
+
+  dispose() {
+    this.isReady = false;
+    this.renderer.dispose();
   }
 }

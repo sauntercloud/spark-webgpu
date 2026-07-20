@@ -20,6 +20,8 @@
       right: 12px;
       bottom: 12px;
       width: min(360px, calc(100vw - 24px));
+      max-height: calc(100vh - 24px);
+      overflow: auto;
       padding: 10px;
       border-radius: 6px;
       background: rgb(0 0 0 / 68%);
@@ -68,6 +70,39 @@
 
     #camera-panel .row.render-row {
       grid-template-columns: 92px minmax(0, 1fr) 70px;
+    }
+
+    #camera-panel .row.config-row {
+      grid-template-columns: minmax(0, 1fr) 132px;
+    }
+
+    #camera-panel .row.config-row input[type="checkbox"] {
+      justify-self: end;
+      width: 18px;
+      height: 18px;
+      accent-color: #7db7ff;
+    }
+
+    #camera-panel select {
+      min-width: 0;
+      height: 24px;
+      border: 1px solid rgb(255 255 255 / 18%);
+      border-radius: 4px;
+      background: #20242b;
+      color: #fff;
+      padding: 2px 5px;
+      font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    #camera-panel .runtime-status {
+      margin: 8px 0;
+      padding: 7px;
+      border: 1px solid rgb(125 183 255 / 25%);
+      border-radius: 4px;
+      background: rgb(0 0 0 / 28%);
+      color: #bcd8ff;
+      white-space: pre-wrap;
+      font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
     }
 
     #camera-panel .render-controls {
@@ -192,22 +227,47 @@
   <script type="module">
     import * as THREE from "three";
     import {
-      PackedSplats,
-      SplatMesh,
-      SparkRenderer,
-      createSparkWebGPUBackend,
+      createSparkRenderer,
     } from "@sparkjsdev/spark";
     import { getAssetFileURL } from "../js/get-asset-url.js";
 
     const params = new URLSearchParams(window.location.search);
-    const backendKind = params.get("backend") === "webgpu" ? "webgpu" : "webgl2";
+    const requestedBackend = params.get("backend");
+    const backendPreference = requestedBackend === "webgpu" || requestedBackend === "webgl2" ? requestedBackend : "auto";
     const debug = params.get("debug") === "1";
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
-    const rendererContext = backendKind === "webgpu"
-      ? await createWebGPURendererContext()
-      : createWebGL2RendererContext(scene);
-    const renderer = rendererContext.renderer;
+    async function createRendererBackend(backend) {
+      return createSparkRenderer({
+        backend,
+        webgpuSplat: {
+        sizeScale: readPositiveNumberParam("sizeScale") ?? 1,
+        preBlurAmount: readNumberParam("preBlurAmount") ?? 0,
+        falloff: readNumberParam("falloff") ?? 1,
+        highPrecisionProjected: params.get("highPrecisionProjected") === "1",
+        sort: params.get("sort") !== "off",
+        sortRadial: params.get("sort") !== "z",
+        onDirty: requestRender,
+        renderSortedCamera: params.get("renderCamera") === "sorted",
+        gpuSortAlgorithm: readGPUSortAlgorithm(),
+        gpuSortMaxSplats: readPositiveNumberParam("gpuSortMaxSplats"),
+        gpuSortBucketBits: readPositiveNumberParam("gpuSortBucketBits") ?? 16,
+        gpuSortBucketCount: readPositiveNumberParam("gpuSortBucketCount"),
+        gpuSortRadix: params.get("gpuSortRadix") !== "0" && params.get("gpuSortRadixUnsafe") !== "0",
+        sortGPU: params.get("sortGPU") !== "0",
+        workerSortFallback: params.get("workerSortFallback") !== "0",
+        gpuSortDebugOnce: params.get("gpuSortDebugOnce") === "1",
+        gpuSortTimestamp: params.get("gpuSortTimestamp") === "1",
+        },
+        onFallback: (error) => console.warn("WebGPU unavailable, using WebGL2", error),
+      });
+    }
+    let spark = await createRendererBackend(backendPreference);
+    let backendKind = spark.backend;
+    let renderer = spark.renderer;
+    spark.setSize(window.innerWidth, window.innerHeight);
+    spark.setPixelRatio(readPositiveNumberParam("maxDpr") ?? window.devicePixelRatio);
+    renderer.setClearColor(0x000000, 1);
     document.body.appendChild(renderer.domElement);
     const webgpuRenderControls = {
       minAlpha: readPositiveNumberParam("minAlpha") ?? 3 / 255,
@@ -216,35 +276,41 @@
       blurAmount: readNumberParam("blurAmount") ?? 0,
     };
 
-    const controls = createFlyControls(camera, renderer.domElement, {
+    const controlOptions = {
       damping: readPositiveNumberParam("damping") ?? 0.2,
       lookSpeed: readPositiveNumberParam("lookSpeed") ?? 0.003,
       moveSpeed: readPositiveNumberParam("moveSpeed") ?? 4,
       verticalSpeed: readPositiveNumberParam("verticalSpeed") ?? 1.2,
       boost: readPositiveNumberParam("boost") ?? 3,
-    });
-    const cameraPanel = createCameraPanel(camera, controls, rendererContext.spark);
+    };
+    let controls = createFlyControls(camera, renderer.domElement, controlOptions);
+    let model = null;
+    let loadSerial = 0;
+    let animationFrame = 0;
+    let keepRendering = false;
+    let debugRuntimeStatus = null;
+    let currentModelSource = null;
+    let switchingBackend = false;
+    const controlsBridge = {
+      syncFromCamera: () => controls.syncFromCamera?.(),
+    };
+    const cameraPanel = createCameraPanel(camera, controlsBridge, spark.sparkRenderer);
 
     window.addEventListener('resize', onWindowResize, false);
     function onWindowResize() {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
+      spark.setSize(window.innerWidth, window.innerHeight);
       requestRender();
     }
 
-    let model = null;
-    let loadSerial = 0;
-    let animationFrame = 0;
-    let keepRendering = false;
     installLocalFileDrop();
 
     const splatURL = await getAssetFileURL("butterfly.spz");
     await loadModel({
       label: splatURL,
-      create: () => backendKind === "webgpu"
-        ? createWebGPUSplat(rendererContext.backend, splatURL)
-        : createWebGL2Splat({ url: splatURL }),
+      source: { url: splatURL },
+      create: () => createModelFromSource(spark, { url: splatURL }),
     });
 
     function requestRender() {
@@ -266,19 +332,13 @@
 
     function renderOnce() {
       animationFrame = 0;
-      const controlsChanged = controls.update();
-      if (backendKind === "webgpu") {
-        rendererContext.backend.render(scene, camera);
-      } else {
-        renderer.render(scene, camera);
-      }
+      controls.update();
+      spark.render(scene, camera);
       cameraPanel.update();
-      if (keepRendering || controlsChanged || model?.sortPending) {
-        requestRender();
-      }
+      requestRender();
     }
 
-    async function loadModel({ label, create }) {
+    async function loadModel({ label, source, create }) {
       const serial = ++loadSerial;
       try {
         const nextModel = await create();
@@ -288,10 +348,75 @@
           return;
         }
         replaceModel(nextModel);
+        currentModelSource = source;
         frameModel(nextModel);
         requestRender();
       } catch (error) {
         console.error(error);
+      }
+    }
+
+    function createModelFromSource(sparkInstance, source) {
+      return sparkInstance.createSplatMesh({
+        ...source,
+        webgpu: readWebGPUDebugSortOptions(),
+      });
+    }
+
+    async function switchRendererBackend(useWebGPU) {
+      const targetBackend = useWebGPU ? "webgpu" : "webgl2";
+      if (switchingBackend || backendKind === targetBackend) {
+        return;
+      }
+      switchingBackend = true;
+      let nextSpark = null;
+      try {
+        nextSpark = await createRendererBackend(targetBackend);
+        nextSpark.setSize(window.innerWidth, window.innerHeight);
+        nextSpark.setPixelRatio(readPositiveNumberParam("maxDpr") ?? window.devicePixelRatio);
+        nextSpark.renderer.setClearColor(0x000000, 1);
+
+        const nextModel = currentModelSource
+          ? await createModelFromSource(nextSpark, currentModelSource)
+          : null;
+        if (nextModel && model) {
+          nextModel.position.copy(model.position);
+          nextModel.quaternion.copy(model.quaternion);
+          nextModel.scale.copy(model.scale);
+          nextModel.visible = model.visible;
+        }
+
+        const oldSpark = spark;
+        const oldRenderer = renderer;
+        const oldControls = controls;
+        const oldModel = model;
+        oldRenderer.domElement.replaceWith(nextSpark.renderer.domElement);
+        oldControls.dispose();
+        if (oldModel) scene.remove(oldModel);
+        if (oldSpark.sparkRenderer) scene.remove(oldSpark.sparkRenderer);
+
+        spark = nextSpark;
+        backendKind = nextSpark.backend;
+        renderer = nextSpark.renderer;
+        controls = createFlyControls(camera, renderer.domElement, controlOptions);
+        model = nextModel;
+        if (nextModel) {
+          scene.add(nextModel);
+          nextModel.setRenderOptions?.(webgpuRenderControls);
+        }
+        cameraPanel.rebuildRenderControls(spark.sparkRenderer);
+        setLiveUrlParam("backend", backendKind);
+
+        if (oldModel) oldSpark.disposeSplatMesh(oldModel);
+        oldSpark.dispose();
+        nextSpark = null;
+        requestRender();
+      } catch (error) {
+        nextSpark?.dispose();
+        console.error(`Unable to switch renderer to ${targetBackend}`, error);
+        cameraPanel.rebuildRenderControls(spark.sparkRenderer);
+      } finally {
+        switchingBackend = false;
       }
     }
 
@@ -308,10 +433,7 @@
     }
 
     function disposeModel(disposedModel) {
-      disposedModel.dispose?.();
-      if (backendKind === "webgpu") {
-        disposedModel.packedSplats?.dispose?.();
-      }
+      spark.disposeSplatMesh(disposedModel);
     }
 
     function createCameraPanel(camera, controls, spark) {
@@ -328,7 +450,7 @@
         json: document.getElementById("cam-json"),
         message: document.getElementById("cam-message"),
       };
-      const renderFields = createRenderControlFields(fields.renderControls, spark);
+      let renderFields = createRenderControlFields(fields.renderControls, spark);
       const euler = new THREE.Euler(0, 0, 0, "YXZ");
       let editing = false;
       let messageTimer = 0;
@@ -483,14 +605,26 @@
         for (const field of renderFields) {
           setRenderControlValue(field.slider, field.valueInput, field.getValue());
         }
+        updateDebugRuntimeStatus();
         fields.json.value = cameraSnapshotText();
       }
 
       update(true);
-      return { update };
+      return {
+        update,
+        rebuildRenderControls(nextSpark) {
+          fields.renderControls.replaceChildren();
+          debugRuntimeStatus = null;
+          renderFields = createRenderControlFields(
+            fields.renderControls,
+            nextSpark,
+          );
+          update(true);
+        },
+      };
     }
 
-    function createRenderControlFields(container, spark) {
+    function createRenderControlFields(container, legacySpark) {
       if (!debug) {
         return [];
       }
@@ -499,6 +633,7 @@
       title.className = "section-title";
       title.textContent = `Render (${backendKind})`;
       container.appendChild(title);
+      createBackendAndSortControls(container);
 
       const definitions = backendKind === "webgpu"
         ? [
@@ -538,7 +673,7 @@
 
         const getValue = () => backendKind === "webgpu"
           ? webgpuRenderControls[definition.key]
-          : spark[definition.key];
+          : legacySpark[definition.key];
         const apply = () => {
           const value = Number(valueInput.value);
           if (!Number.isFinite(value)) {
@@ -549,7 +684,7 @@
             webgpuRenderControls[definition.key] = clamped;
             model?.setRenderOptions?.(webgpuRenderControls);
           } else {
-            spark[definition.key] = clamped;
+            legacySpark[definition.key] = clamped;
           }
           setRenderControlValue(slider, valueInput, clamped);
           requestRender();
@@ -558,6 +693,155 @@
         setRenderControlValue(slider, valueInput, getValue());
         return { slider, valueInput, getValue };
       });
+    }
+
+    function createBackendAndSortControls(container) {
+      const configTitle = document.createElement("div");
+      configTitle.className = "section-title";
+      configTitle.textContent = "Configuration";
+      container.appendChild(configTitle);
+
+      const useWebGPU = backendKind === "webgpu";
+      createDebugToggle(container, "Render with WebGPU", useWebGPU, (enabled) => {
+        void switchRendererBackend(enabled);
+      });
+
+      if (useWebGPU) {
+        createDebugToggle(container, "Use GPU sorting", params.get("sortGPU") !== "0", (enabled) => {
+        setLiveUrlParam("sortGPU", enabled ? "1" : "0");
+        model?.setSortOptions?.({ sortGPU: enabled, retryGPU: enabled });
+        requestRender();
+        });
+        createDebugToggle(container, "Enable Worker thread", params.get("workerSortFallback") !== "0", (enabled) => {
+        setLiveUrlParam("workerSortFallback", enabled ? "1" : "0");
+        model?.setSortOptions?.({ workerSortFallback: enabled });
+        requestRender();
+        });
+
+        const selectedAlgorithm = readGPUSortAlgorithm() ?? "adaptive";
+        createDebugSelect(
+          container,
+          "Sorting algorithm",
+          selectedAlgorithm,
+          ["adaptive", "counting", "radix", "bucket", "bitonic"],
+          (value) => {
+            setLiveUrlParam("gpuSortAlgorithm", value);
+            model?.setSortOptions?.({ gpuSortAlgorithm: value, retryGPU: true });
+            cameraPanel.rebuildRenderControls(spark.sparkRenderer);
+            requestRender();
+          },
+        );
+        if (selectedAlgorithm === "adaptive" || selectedAlgorithm === "radix" || selectedAlgorithm === "bucket") {
+          createDebugToggle(container, "Enable radix refinement", params.get("gpuSortRadix") !== "0", (enabled) => {
+            setLiveUrlParam("gpuSortRadix", enabled ? "1" : "0");
+            model?.setSortOptions?.({ gpuSortRadix: enabled, retryGPU: true });
+            requestRender();
+          });
+        }
+        if (selectedAlgorithm === "adaptive" || selectedAlgorithm === "counting") {
+          const initialBuckets = String(
+            readPositiveNumberParam("gpuSortBucketCount") ?? spark.profile.gpuSortBucketCount,
+          );
+          createDebugSelect(
+            container,
+            "Counting buckets",
+            initialBuckets,
+            ["65536", "131072"],
+            (value) => {
+              const bucketCount = Number(value);
+              setLiveUrlParam("gpuSortBucketCount", value);
+              model?.setSortOptions?.({ gpuSortBucketCount: bucketCount, retryGPU: true });
+              requestRender();
+            },
+          );
+        }
+      }
+
+      const statusTitle = document.createElement("div");
+      statusTitle.className = "section-title";
+      statusTitle.textContent = "Actual runtime";
+      container.appendChild(statusTitle);
+      debugRuntimeStatus = document.createElement("div");
+      debugRuntimeStatus.className = "runtime-status";
+      container.appendChild(debugRuntimeStatus);
+      updateDebugRuntimeStatus();
+    }
+
+    function createDebugToggle(container, labelText, checked, onChange) {
+      const row = document.createElement("label");
+      row.className = "row config-row";
+      const label = document.createElement("span");
+      label.textContent = labelText;
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = checked;
+      input.addEventListener("change", () => onChange(input.checked));
+      row.append(label, input);
+      container.appendChild(row);
+      return input;
+    }
+
+    function createDebugSelect(container, labelText, value, options, onChange) {
+      const row = document.createElement("label");
+      row.className = "row config-row";
+      const label = document.createElement("span");
+      label.textContent = labelText;
+      const select = document.createElement("select");
+      for (const optionValue of options) {
+        const option = document.createElement("option");
+        option.value = optionValue;
+        option.textContent = optionValue;
+        select.appendChild(option);
+      }
+      select.value = value;
+      select.addEventListener("change", () => onChange(select.value));
+      row.append(label, select);
+      container.appendChild(row);
+      return select;
+    }
+
+    function updateDebugRuntimeStatus() {
+      if (!debugRuntimeStatus) {
+        return;
+      }
+      if (backendKind !== "webgpu") {
+        debugRuntimeStatus.textContent = [
+          `backend: webgl2`,
+          "sorting: Spark WebGL2 worker pipeline",
+        ].join("\n");
+        return;
+      }
+
+      const state = model?.getDebugState?.();
+      if (!state) {
+        debugRuntimeStatus.textContent = [
+          "backend: webgpu",
+          "sorting: waiting for model",
+        ].join("\n");
+        return;
+      }
+      const fallbackActive = state.sortGPU && state.lastSortMode === "worker";
+      debugRuntimeStatus.textContent = [
+        "backend: webgpu",
+        `sorting path: ${state.lastSortMode}`,
+        `requested algorithm: ${state.gpuSortAlgorithm}`,
+        `resolved algorithm: ${state.adaptiveGPULastResolvedAlgorithm}`,
+        `GPU sort limit: ${state.gpuSortMaxSplats.toLocaleString()}`,
+        `counting buckets: ${state.gpuSortBucketCount}`,
+        `worker thread: ${state.workerSortFallback ? "enabled" : "disabled"}`,
+        `fallback active: ${fallbackActive ? "worker" : "no"}`,
+        `fallback reason: ${state.lastGPUSortFallbackReason}`,
+        `sort pending: ${state.sortPending ? "yes" : "no"}`,
+        `3DGS pass: ${state.renderer?.lastSubmittedPass ?? "initializing"}`,
+        `visible splats: ${state.visibleDrawCount.toLocaleString()}`,
+      ].join("\n");
+    }
+
+    function setLiveUrlParam(name, value) {
+      params.set(name, value);
+      const url = new URL(window.location.href);
+      url.searchParams.set(name, value);
+      window.history.replaceState(null, "", url);
     }
 
     function parseCameraText(text) {
@@ -706,6 +990,16 @@
       domElement.addEventListener("pointercancel", onPointerUp);
 
       return {
+        dispose() {
+          window.removeEventListener("keydown", onKeyDown);
+          window.removeEventListener("keyup", onKeyUp);
+          domElement.removeEventListener("pointerdown", onPointerDown);
+          domElement.removeEventListener("pointermove", onPointerMove);
+          domElement.removeEventListener("pointerup", onPointerUp);
+          domElement.removeEventListener("pointercancel", onPointerUp);
+          keys.clear();
+          dragging = false;
+        },
         syncFromCamera() {
           euler.setFromQuaternion(camera.quaternion, "YXZ");
         },
@@ -743,54 +1037,6 @@
       };
     }
 
-    async function createWebGPUSplat(backend, url) {
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`${response.status} ${response.statusText} fetching ${url}`);
-      }
-      return createWebGPUSplatFromBytes(backend, await response.arrayBuffer(), url);
-    }
-
-    async function createWebGPUSplatFromBytes(backend, fileBytes, fileName) {
-      const packedSplats = new PackedSplats({
-        fileBytes,
-        fileName,
-      });
-      await packedSplats.initialized;
-      const gpuSortAlgorithmParam = params.get("gpuSortAlgorithm");
-      const gpuSortAlgorithm = gpuSortAlgorithmParam === "bitonic" || gpuSortAlgorithmParam === "radix" || gpuSortAlgorithmParam === "bucket" || gpuSortAlgorithmParam === "counting" ? gpuSortAlgorithmParam : "adaptive";
-      const gpuSortRadix = (gpuSortAlgorithm === "radix" || gpuSortAlgorithm === "bucket" || gpuSortAlgorithm === "counting" || gpuSortAlgorithm === "adaptive") &&
-        params.get("gpuSortRadix") !== "0" &&
-        params.get("gpuSortRadixUnsafe") !== "0";
-      return backend.createSplatMesh(packedSplats, {
-        sizeScale: readPositiveNumberParam("sizeScale") ?? 1,
-        blurAmount: webgpuRenderControls.blurAmount,
-        preBlurAmount: readNumberParam("preBlurAmount") ?? 0,
-        falloff: readNumberParam("falloff") ?? 1,
-        alphaBias: webgpuRenderControls.alphaBias,
-        alphaRadiusScale: webgpuRenderControls.alphaRadiusScale,
-        highPrecisionProjected: params.get("highPrecisionProjected") === "1",
-        minAlpha: webgpuRenderControls.minAlpha,
-        maxStdDev: readPositiveNumberParam("maxStdDev") ?? Math.sqrt(8),
-        sort: params.get("sort") !== "off",
-        sortRadial: params.get("sort") !== "z",
-        onDirty: requestRender,
-        renderSortedCamera: params.get("renderCamera") === "sorted",
-        sortGPU: backendKind === "webgpu",
-        gpuSortMaxSplats: readPositiveNumberParam("gpuSortMaxSplats") ?? (gpuSortAlgorithm === "radix" || gpuSortAlgorithm === "bucket" || gpuSortAlgorithm === "counting" || gpuSortAlgorithm === "adaptive" ? Number.MAX_SAFE_INTEGER : undefined),
-        gpuSortAlgorithm,
-        gpuSortBucketBits: readPositiveNumberParam("gpuSortBucketBits") ?? 16,
-        gpuSortBucketCount: readPositiveNumberParam("gpuSortBucketCount") ?? 131072,
-        gpuSortRadix,
-        gpuSortDebugOnce: params.get("gpuSortDebugOnce") === "1",
-        gpuSortTimestamp: params.get("gpuSortTimestamp") === "1",
-      });
-    }
-
-    function createWebGL2Splat({ url, fileBytes, fileName }) {
-      return new SplatMesh({ url, fileBytes, fileName });
-    }
-
     function installLocalFileDrop() {
       document.addEventListener("dragover", (event) => {
         event.preventDefault();
@@ -802,32 +1048,29 @@
           return;
         }
         const fileBytes = await file.arrayBuffer();
+        const source = { fileBytes, fileName: file.name };
         await loadModel({
           label: file.name,
-          create: () => backendKind === "webgpu"
-            ? createWebGPUSplatFromBytes(rendererContext.backend, fileBytes, file.name)
-            : createWebGL2Splat({ fileBytes, fileName: file.name }),
+          source,
+          create: () => createModelFromSource(spark, source),
         });
       });
     }
 
-    function createWebGL2RendererContext(scene) {
-      const renderer = new THREE.WebGLRenderer();
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, Number(params.get("maxDpr") ?? window.devicePixelRatio)));
-      renderer.setClearColor(0x000000, 1);
-      const spark = new SparkRenderer({ renderer });
-      scene.add(spark);
-      return { backendKind: "webgl2", renderer, backend: null, spark };
+    function readGPUSortAlgorithm() {
+      const value = params.get("gpuSortAlgorithm");
+      return value === "bitonic" || value === "radix" || value === "bucket" || value === "counting"
+        ? value
+        : undefined;
     }
 
-    async function createWebGPURendererContext() {
-      const backend = await createSparkWebGPUBackend();
-      const renderer = backend.renderer;
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, Number(params.get("maxDpr") ?? window.devicePixelRatio)));
-      renderer.setClearColor(0x000000, 1);
-      return { backendKind: "webgpu", renderer, backend, spark: null };
+    function readWebGPUDebugSortOptions() {
+      return {
+        sortGPU: params.get("sortGPU") !== "0",
+        workerSortFallback: params.get("workerSortFallback") !== "0",
+        gpuSortRadix: params.get("gpuSortRadix") !== "0",
+        gpuSortBucketCount: readPositiveNumberParam("gpuSortBucketCount"),
+      };
     }
 
     function readPositiveNumberParam(name) {

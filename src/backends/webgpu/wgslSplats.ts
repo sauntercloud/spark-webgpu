@@ -1,5 +1,9 @@
 import * as THREE from "three";
 import type { PackedSplats } from "../../PackedSplats";
+import { SplatWorker } from "../../SplatWorker";
+import { clampGPUCountingBucketCount } from "./profiles";
+
+let directWGSLSortId = 0;
 
 export interface CreateWebGPUWGSLSplatOptions {
   sizeScale?: number;
@@ -27,6 +31,7 @@ export interface CreateWebGPUWGSLSplatOptions {
   gpuSortBucketCount?: number;
   gpuSortRadix?: boolean;
   gpuSortRadixUnsafe?: boolean;
+  workerSortFallback?: boolean;
   gpuSortDebugOnce?: boolean;
   gpuSortTimestamp?: boolean;
 }
@@ -48,10 +53,8 @@ interface WebGPUSplatSource {
 interface WebGPURendererLike {
   backend?: unknown;
   getDrawingBufferSize?: (target: THREE.Vector2) => THREE.Vector2;
-  getClearColor?: (target: THREE.Color) => {
-    r: number;
-    g: number;
-    b: number;
+  getClearColor?: (target: THREE.Color & { a: number }) => THREE.Color & {
+    a: number;
   };
   getClearAlpha?: () => number;
 }
@@ -89,6 +92,7 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
   gpuSortBucketBits: number;
   gpuSortBucketCount: number;
   gpuSortRadix: boolean;
+  workerSortFallback: boolean;
   gpuSortDebugOnce: boolean;
   gpuSortTimestamp: boolean;
 
@@ -135,6 +139,11 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
   private gpuSortDebugReadbackCount = 0;
   private gpuSortDebugReadbackDone = false;
   private gpuSortInFlight = false;
+  private gpuSortUnavailable = false;
+  private cpuSortWorker: SplatWorker | null = null;
+  private cpuSortInitialized: Promise<void> | null = null;
+  private cpuSortInFlight = false;
+  private readonly cpuSortId = ++directWGSLSortId;
   private adaptiveGPUStableFrames = 0;
   private adaptiveGPULastPrecisePosition = new THREE.Vector3(
     Number.POSITIVE_INFINITY,
@@ -186,6 +195,7 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
       gpuSortBucketCount = 131072,
       gpuSortRadix,
       gpuSortRadixUnsafe = false,
+      workerSortFallback = true,
       gpuSortDebugOnce = false,
       gpuSortTimestamp = false,
     }: CreateWebGPUWGSLSplatOptions = {},
@@ -222,6 +232,7 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
     this.gpuSortBucketBits = clampGPUSortBucketBits(gpuSortBucketBits);
     this.gpuSortBucketCount = clampGPUCountingBucketCount(gpuSortBucketCount);
     this.gpuSortRadix = gpuSortRadix ?? gpuSortRadixUnsafe;
+    this.workerSortFallback = workerSortFallback;
     this.gpuSortDebugOnce = gpuSortDebugOnce;
     this.gpuSortTimestamp = gpuSortTimestamp;
     this.frustumCulled = false;
@@ -278,7 +289,74 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
     }
   }
 
-  dispose() {}
+  setSortOptions({
+    sortGPU,
+    workerSortFallback,
+    gpuSortAlgorithm,
+    gpuSortRadix,
+    gpuSortBucketCount,
+    retryGPU = false,
+  }: {
+    sortGPU?: boolean;
+    workerSortFallback?: boolean;
+    gpuSortAlgorithm?: CreateWebGPUWGSLSplatOptions["gpuSortAlgorithm"];
+    gpuSortRadix?: boolean;
+    gpuSortBucketCount?: number;
+    retryGPU?: boolean;
+  }) {
+    if (sortGPU !== undefined) this.sortGPU = sortGPU;
+    if (workerSortFallback !== undefined) {
+      this.workerSortFallback = workerSortFallback;
+    }
+    if (
+      gpuSortAlgorithm !== undefined &&
+      gpuSortAlgorithm !== this.gpuSortAlgorithm
+    ) {
+      this.gpuSortAlgorithm = gpuSortAlgorithm;
+      this.renderer?.dispose();
+      this.renderer = null;
+      this.displayCamera = null;
+      this.pendingOrder = null;
+      this.orderDirty = false;
+      this.gpuOrderUpdated = false;
+    }
+    if (gpuSortRadix !== undefined) this.gpuSortRadix = gpuSortRadix;
+    if (gpuSortBucketCount !== undefined) {
+      this.gpuSortBucketCount = clampGPUCountingBucketCount(gpuSortBucketCount);
+    }
+    if (
+      retryGPU ||
+      sortGPU !== undefined ||
+      gpuSortAlgorithm !== undefined ||
+      gpuSortRadix !== undefined ||
+      gpuSortBucketCount !== undefined
+    ) {
+      this.gpuSortUnavailable = false;
+      this.lastGPUSortFallbackReason = "none";
+    }
+    this.adaptiveGPUStableFrames = 0;
+    this.adaptiveGPUNeedsPreciseSort = false;
+    this.sortedOrderCameraPosition.setScalar(Number.POSITIVE_INFINITY);
+    this.sortedOrderCameraQuaternion.set(
+      Number.POSITIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+    );
+    this.renderer?.invalidateRenderState("sort-options");
+    this.notifyDirty();
+  }
+
+  dispose() {
+    this.cpuSortWorker?.dispose();
+    this.cpuSortWorker = null;
+    this.cpuSortInitialized = null;
+    this.renderer?.dispose();
+    this.renderer = null;
+    this.sortData = null;
+    this.pendingOrder = null;
+    this.displayCamera = null;
+  }
 
   renderWebGPUDirect(
     renderer: WebGPURendererLike,
@@ -295,30 +373,33 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
     this.updateMatrixWorld();
     camera.updateMatrixWorld();
     camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
-    this.renderer ??= new DirectWGSLSplatRenderer(
-      device,
-      context,
-      this.packedSplats,
-      {
-        sizeScale: this.sizeScale,
-        opacityScale: this.opacityScale,
-        minAlpha: this.minAlpha,
-        maxPixelRadius: this.maxPixelRadius,
-        maxStdDev: this.maxStdDev,
-        blurAmount: this.blurAmount,
-        preBlurAmount: this.preBlurAmount,
-        falloff: this.falloff,
-        alphaBias: this.alphaBias,
-        alphaRadiusScale: this.alphaRadiusScale,
-        highPrecisionProjected: this.highPrecisionProjected,
-        focalAdjustment: this.focalAdjustment,
-        renderEpsilon: this.renderEpsilon,
-        gpuSortTimestamp: this.gpuSortTimestamp,
-      },
-      () => this.notifyDirty(),
-    );
-    this.updateOrder(camera);
     try {
+      this.renderer ??= new DirectWGSLSplatRenderer(
+        device,
+        context,
+        this.packedSplats,
+        {
+          sizeScale: this.sizeScale,
+          opacityScale: this.opacityScale,
+          minAlpha: this.minAlpha,
+          maxPixelRadius: this.maxPixelRadius,
+          maxStdDev: this.maxStdDev,
+          blurAmount: this.blurAmount,
+          preBlurAmount: this.preBlurAmount,
+          falloff: this.falloff,
+          alphaBias: this.alphaBias,
+          alphaRadiusScale: this.alphaRadiusScale,
+          highPrecisionProjected: this.highPrecisionProjected,
+          focalAdjustment: this.focalAdjustment,
+          renderEpsilon: this.renderEpsilon,
+          gpuSortTimestamp: this.gpuSortTimestamp,
+          sortGPU: this.sortGPU,
+          gpuSortAlgorithm: this.gpuSortAlgorithm,
+          gpuSortRadix: this.gpuSortRadix,
+        },
+        () => this.notifyDirty(),
+      );
+      this.updateOrder(camera);
       let uploadedOrder = this.gpuOrderUpdated;
       this.gpuOrderUpdated = false;
       if (this.orderDirty) {
@@ -381,6 +462,9 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
       gpuSortDebugReadbackCount: this.gpuSortDebugReadbackCount,
       gpuSortTimestamp: this.gpuSortTimestamp,
       gpuSortInFlight: this.gpuSortInFlight,
+      gpuSortUnavailable: this.gpuSortUnavailable,
+      cpuSortInFlight: this.cpuSortInFlight,
+      workerSortFallback: this.workerSortFallback,
       lastCullLatencyMs: this.lastCullLatencyMs,
       maxCullLatencyMs: this.maxCullLatencyMs,
       lastGPUSortQueueLatencyMs: this.lastGPUSortQueueLatencyMs,
@@ -431,6 +515,7 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
     const needsAdaptivePreciseSort =
       this.sort &&
       this.sortGPU &&
+      this.gpuSortRadix &&
       this.gpuSortAlgorithm === "adaptive" &&
       this.adaptiveGPUNeedsPreciseSort &&
       (position.distanceTo(this.adaptiveGPULastPrecisePosition) > 0.001 ||
@@ -441,15 +526,29 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
     }
     this.sortData ??= createDirectWGSLSortData(this.packedSplats);
     if (this.sort) {
-      if (!this.sortGPU) {
-        this.lastSortMode = "none";
+      if (
+        this.sortGPU &&
+        !this.gpuSortUnavailable &&
+        this.sortDirectGPU(camera, position, quaternion)
+      ) {
         return;
       }
-      if (!this.sortDirectGPU(camera, position, quaternion)) {
-        this.lastSortMode = "gpu-unavailable";
+      if (this.sortGPU && !this.gpuSortUnavailable) {
+        this.gpuSortUnavailable = true;
         console.warn(
-          `Spark WebGPU GPU sort unavailable: ${this.lastGPUSortFallbackReason}`,
+          `Spark WebGPU GPU sort unavailable; falling back to Worker sort: ${this.lastGPUSortFallbackReason}`,
         );
+      }
+      if (this.workerSortFallback) {
+        this.sortDirectCPU(camera, position, quaternion);
+      } else {
+        if (this.lastSortMode !== "unavailable") {
+          console.error(
+            "Spark WebGPU sorting unavailable and Worker fallback is disabled",
+          );
+        }
+        this.lastSortMode = "unavailable";
+        this.sortPending = false;
       }
       return;
     }
@@ -504,10 +603,7 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
     }
     this.lastGPUSortFallbackReason = "none";
     this.gpuSortSubmitCount++;
-    this.lastSortMode =
-      this.gpuSortAlgorithm === "adaptive"
-        ? `gpu:${adaptiveSort.label}`
-        : "gpu";
+    this.lastSortMode = `gpu:${adaptiveSort.label}`;
     if (sorted.debugReadback) {
       this.gpuSortDebugReadbackDone = true;
       this.gpuSortDebugReadbackCount++;
@@ -531,7 +627,7 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
       this.adaptiveGPUNeedsPreciseSort = false;
     } else if (
       this.gpuSortAlgorithm === "adaptive" &&
-      adaptiveSort.label === "counting131072"
+      adaptiveSort.label.startsWith("counting")
     ) {
       this.adaptiveGPUNeedsPreciseSort = true;
     }
@@ -557,7 +653,7 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
       ) {
         this.notifyDirty();
       }
-      this.flushDeferredGPUSortRequest();
+      this.flushDeferredSortRequest();
     });
     this.lastSortLatencyMs = performance.now() - requestStart;
     this.maxSortLatencyMs = Math.max(
@@ -566,6 +662,88 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
     );
     this.renderer.invalidateRenderState("order");
     this.notifyDirty();
+    return true;
+  }
+
+  private sortDirectCPU(
+    camera: THREE.Camera,
+    position: THREE.Vector3,
+    quaternion: THREE.Quaternion,
+  ) {
+    if (!this.sortData) return false;
+    const sortData = this.sortData;
+    if (this.cpuSortInFlight) {
+      this.sortDeferCount++;
+      this.deferGPUSortRequest(camera, position, quaternion);
+      this.sortPending = true;
+      return true;
+    }
+
+    this.cpuSortWorker ??= new SplatWorker();
+    const worker = this.cpuSortWorker;
+    this.cpuSortInitialized ??= worker
+      .call("initDirectWGSLSort", {
+        id: this.cpuSortId,
+        positions: sortData.positions.slice(),
+      })
+      .then(() => undefined);
+
+    const requestStart = performance.now();
+    const requestSerial = ++this.latestSortRequestSerial;
+    const matrix = new Float32Array(
+      scratchSortMatrix
+        .copy(camera.matrixWorldInverse)
+        .multiply(this.matrixWorld).elements,
+    );
+    const sortedCamera = cloneCameraState(camera);
+    const sortedPosition = position.clone();
+    const sortedQuaternion = quaternion.clone();
+    this.cpuSortInFlight = true;
+    this.sortPending = true;
+    this.sortRequestCount++;
+    this.lastOrderCameraPosition.copy(position);
+    this.lastOrderCameraQuaternion.copy(quaternion);
+
+    void this.cpuSortInitialized
+      .then(
+        () =>
+          worker.call("sortDirectWGSLSplats", {
+            id: this.cpuSortId,
+            matrix,
+            radial: this.sortRadial,
+          }) as Promise<{
+            activeSplats: number;
+            ordering: Uint32Array;
+          }>,
+      )
+      .then(({ activeSplats, ordering }) => {
+        this.sortCompleteCount++;
+        this.sortPublishCount++;
+        this.publishedSortRequestSerial = requestSerial;
+        sortData.indices = ordering;
+        sortData.visibleCount = activeSplats;
+        this.pendingOrder = { indices: ordering, visibleCount: activeSplats };
+        this.displayCamera = sortedCamera;
+        this.sortedOrderCameraPosition.copy(sortedPosition);
+        this.sortedOrderCameraQuaternion.copy(sortedQuaternion);
+        this.orderDirty = true;
+        this.lastSortMode = "worker";
+        this.lastSortLatencyMs = performance.now() - requestStart;
+        this.maxSortLatencyMs = Math.max(
+          this.maxSortLatencyMs,
+          this.lastSortLatencyMs,
+        );
+      })
+      .catch((error) => {
+        this.sortDropCount++;
+        console.error("Spark WebGPU Worker sort failed", error);
+      })
+      .finally(() => {
+        this.cpuSortInFlight = false;
+        this.sortPending = Boolean(this.deferredGPUSortCamera);
+        this.notifyDirty();
+        this.flushDeferredSortRequest();
+      });
     return true;
   }
 
@@ -611,7 +789,11 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
     const preciseAngleDelta = 2 * Math.acos(preciseQuaternionDot);
     const preciseCurrent =
       precisePositionDelta < 0.001 && preciseAngleDelta < 0.001;
-    if (this.adaptiveGPUStableFrames >= 3 && !preciseCurrent) {
+    if (
+      this.gpuSortRadix &&
+      this.adaptiveGPUStableFrames >= 3 &&
+      !preciseCurrent
+    ) {
       this.adaptiveGPULastResolvedAlgorithm = "radix";
       return {
         algorithm: "radix",
@@ -621,8 +803,8 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
       };
     }
 
-    const bucketCount = 131072;
-    const label = "counting131072";
+    const bucketCount = this.gpuSortBucketCount;
+    const label = `counting${bucketCount}`;
     this.adaptiveGPULastResolvedAlgorithm = label;
     return {
       algorithm: "counting",
@@ -679,8 +861,12 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
     this.deferredGPUSortQuaternion.copy(quaternion);
   }
 
-  private flushDeferredGPUSortRequest() {
-    if (!this.deferredGPUSortCamera || this.gpuSortInFlight) {
+  private flushDeferredSortRequest() {
+    if (
+      !this.deferredGPUSortCamera ||
+      this.gpuSortInFlight ||
+      this.cpuSortInFlight
+    ) {
       return;
     }
     const camera = this.deferredGPUSortCamera;
@@ -690,7 +876,11 @@ export class WebGPUWGSLSplatMesh extends THREE.Object3D {
     );
     this.deferredGPUSortCamera = null;
     this.sortPending = false;
-    this.sortDirectGPU(camera, position, quaternion);
+    if (this.sortGPU && !this.gpuSortUnavailable) {
+      this.sortDirectGPU(camera, position, quaternion);
+    } else if (this.workerSortFallback) {
+      this.sortDirectCPU(camera, position, quaternion);
+    }
   }
 
   private notifyDirty() {
@@ -834,30 +1024,30 @@ class DirectWGSLSplatRenderer {
     gpuCountingSort?: GPUCountingSortState;
   }[];
   private readonly projectPipeline: GPUComputePipeline;
-  private readonly gpuSortKeyPipeline: GPUComputePipeline;
-  private readonly gpuSortPassPipeline: GPUComputePipeline;
-  private readonly gpuSortExtractPipeline: GPUComputePipeline;
-  private readonly gpuSortBindGroupLayout: GPUBindGroupLayout;
-  private readonly gpuRadixBindGroupLayout: GPUBindGroupLayout;
-  private readonly gpuRadixKeyPipeline: GPUComputePipeline;
-  private readonly gpuRadixHistogramPipeline: GPUComputePipeline;
-  private readonly gpuRadixBucketTotalPipeline: GPUComputePipeline;
-  private readonly gpuRadixBucketBasePipeline: GPUComputePipeline;
-  private readonly gpuRadixBlockPrefixPipeline: GPUComputePipeline;
-  private readonly gpuRadixScatterPipeline: GPUComputePipeline;
-  private readonly gpuRadixExtractPipeline: GPUComputePipeline;
-  private readonly gpuCountingBindGroupLayout: GPUBindGroupLayout;
-  private readonly gpuCountingKeyHistogramPipeline: GPUComputePipeline;
-  private readonly gpuCountingBlockPrefixPipeline: GPUComputePipeline;
-  private readonly gpuCountingGroupPrefixPipeline: GPUComputePipeline;
-  private readonly gpuCountingAddGroupBasePipeline: GPUComputePipeline;
-  private readonly gpuCountingScatterPipeline: GPUComputePipeline;
+  private readonly gpuSortKeyPipeline?: GPUComputePipeline;
+  private readonly gpuSortPassPipeline?: GPUComputePipeline;
+  private readonly gpuSortExtractPipeline?: GPUComputePipeline;
+  private readonly gpuSortBindGroupLayout?: GPUBindGroupLayout;
+  private readonly gpuRadixBindGroupLayout?: GPUBindGroupLayout;
+  private readonly gpuRadixKeyPipeline?: GPUComputePipeline;
+  private readonly gpuRadixHistogramPipeline?: GPUComputePipeline;
+  private readonly gpuRadixBucketTotalPipeline?: GPUComputePipeline;
+  private readonly gpuRadixBucketBasePipeline?: GPUComputePipeline;
+  private readonly gpuRadixBlockPrefixPipeline?: GPUComputePipeline;
+  private readonly gpuRadixScatterPipeline?: GPUComputePipeline;
+  private readonly gpuRadixExtractPipeline?: GPUComputePipeline;
+  private readonly gpuCountingBindGroupLayout?: GPUBindGroupLayout;
+  private readonly gpuCountingKeyHistogramPipeline?: GPUComputePipeline;
+  private readonly gpuCountingBlockPrefixPipeline?: GPUComputePipeline;
+  private readonly gpuCountingGroupPrefixPipeline?: GPUComputePipeline;
+  private readonly gpuCountingAddGroupBasePipeline?: GPUComputePipeline;
+  private readonly gpuCountingScatterPipeline?: GPUComputePipeline;
   private readonly renderPipeline: GPURenderPipeline;
   private readonly quadVertexBuffer: GPUBuffer;
   private readonly quadIndexBuffer: GPUBuffer;
   private readonly drawingBufferSize = new THREE.Vector2(1, 1);
   private readonly localToView = new THREE.Matrix4();
-  private readonly clearColor = new THREE.Color();
+  private readonly clearColor = Object.assign(new THREE.Color(), { a: 1 });
   private readonly cameraPosition = new THREE.Vector3();
   private readonly localCameraPosition = new THREE.Vector3();
   private readonly cameraDirection = new THREE.Vector3();
@@ -944,6 +1134,9 @@ class DirectWGSLSplatRenderer {
         | "focalAdjustment"
         | "renderEpsilon"
         | "gpuSortTimestamp"
+        | "sortGPU"
+        | "gpuSortAlgorithm"
+        | "gpuSortRadix"
       >
     >,
     private readonly onReadyForDeferredRender?: () => void,
@@ -1048,252 +1241,268 @@ class DirectWGSLSplatRenderer {
         entryPoint: "cs_main",
       },
     });
-    this.gpuSortBindGroupLayout = device.createBindGroupLayout({
-      label: "spark_wgsl_gpu_sort_bgl",
-      entries: [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "read-only-storage" },
+    if (options.sortGPU && options.gpuSortAlgorithm === "bitonic") {
+      this.gpuSortBindGroupLayout = device.createBindGroupLayout({
+        label: "spark_wgsl_gpu_sort_bgl",
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "read-only-storage" },
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 2,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "uniform" },
+          },
+          {
+            binding: 3,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+        ],
+      });
+      const gpuSortModule = device.createShaderModule({ code: gpuSortWGSL });
+      const gpuSortLayout = device.createPipelineLayout({
+        bindGroupLayouts: [this.gpuSortBindGroupLayout],
+      });
+      this.gpuSortKeyPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_sort_key_pipeline",
+        layout: gpuSortLayout,
+        compute: {
+          module: gpuSortModule,
+          entryPoint: "make_keys",
         },
-        {
-          binding: 1,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+      });
+      this.gpuSortPassPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_sort_pass_pipeline",
+        layout: gpuSortLayout,
+        compute: {
+          module: gpuSortModule,
+          entryPoint: "bitonic_pass",
         },
-        {
-          binding: 2,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "uniform" },
+      });
+      this.gpuSortExtractPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_sort_extract_pipeline",
+        layout: gpuSortLayout,
+        compute: {
+          module: gpuSortModule,
+          entryPoint: "extract_order",
         },
-        {
-          binding: 3,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+      });
+    }
+    if (
+      options.sortGPU &&
+      options.gpuSortRadix &&
+      (options.gpuSortAlgorithm === "radix" ||
+        options.gpuSortAlgorithm === "bucket" ||
+        options.gpuSortAlgorithm === "adaptive")
+    ) {
+      this.gpuRadixBindGroupLayout = device.createBindGroupLayout({
+        label: "spark_wgsl_gpu_radix_sort_bgl",
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "read-only-storage" },
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 2,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 3,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 4,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 5,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 6,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 7,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "uniform" },
+          },
+        ],
+      });
+      const gpuRadixModule = device.createShaderModule({
+        code: gpuRadixSortWGSL,
+      });
+      const gpuRadixLayout = device.createPipelineLayout({
+        bindGroupLayouts: [this.gpuRadixBindGroupLayout],
+      });
+      this.gpuRadixKeyPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_radix_key_pipeline",
+        layout: gpuRadixLayout,
+        compute: {
+          module: gpuRadixModule,
+          entryPoint: "make_keys",
         },
-      ],
-    });
-    const gpuSortModule = device.createShaderModule({ code: gpuSortWGSL });
-    const gpuSortLayout = device.createPipelineLayout({
-      bindGroupLayouts: [this.gpuSortBindGroupLayout],
-    });
-    this.gpuSortKeyPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_sort_key_pipeline",
-      layout: gpuSortLayout,
-      compute: {
-        module: gpuSortModule,
-        entryPoint: "make_keys",
-      },
-    });
-    this.gpuSortPassPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_sort_pass_pipeline",
-      layout: gpuSortLayout,
-      compute: {
-        module: gpuSortModule,
-        entryPoint: "bitonic_pass",
-      },
-    });
-    this.gpuSortExtractPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_sort_extract_pipeline",
-      layout: gpuSortLayout,
-      compute: {
-        module: gpuSortModule,
-        entryPoint: "extract_order",
-      },
-    });
-    this.gpuRadixBindGroupLayout = device.createBindGroupLayout({
-      label: "spark_wgsl_gpu_radix_sort_bgl",
-      entries: [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "read-only-storage" },
+      });
+      this.gpuRadixHistogramPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_radix_histogram_pipeline",
+        layout: gpuRadixLayout,
+        compute: {
+          module: gpuRadixModule,
+          entryPoint: "histogram",
         },
-        {
-          binding: 1,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+      });
+      this.gpuRadixBucketTotalPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_radix_bucket_total_pipeline",
+        layout: gpuRadixLayout,
+        compute: {
+          module: gpuRadixModule,
+          entryPoint: "bucket_totals",
         },
-        {
-          binding: 2,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+      });
+      this.gpuRadixBucketBasePipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_radix_bucket_base_pipeline",
+        layout: gpuRadixLayout,
+        compute: {
+          module: gpuRadixModule,
+          entryPoint: "bucket_bases",
         },
-        {
-          binding: 3,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+      });
+      this.gpuRadixBlockPrefixPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_radix_block_prefix_pipeline",
+        layout: gpuRadixLayout,
+        compute: {
+          module: gpuRadixModule,
+          entryPoint: "block_prefix",
         },
-        {
-          binding: 4,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+      });
+      this.gpuRadixScatterPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_radix_scatter_pipeline",
+        layout: gpuRadixLayout,
+        compute: {
+          module: gpuRadixModule,
+          entryPoint: "scatter",
         },
-        {
-          binding: 5,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+      });
+      this.gpuRadixExtractPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_radix_extract_pipeline",
+        layout: gpuRadixLayout,
+        compute: {
+          module: gpuRadixModule,
+          entryPoint: "extract_order",
         },
-        {
-          binding: 6,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+      });
+    }
+    if (
+      options.sortGPU &&
+      (options.gpuSortAlgorithm === "counting" ||
+        options.gpuSortAlgorithm === "adaptive")
+    ) {
+      this.gpuCountingBindGroupLayout = device.createBindGroupLayout({
+        label: "spark_wgsl_gpu_counting_sort_bgl",
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "read-only-storage" },
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 2,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 3,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 4,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 5,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+          {
+            binding: 6,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "uniform" },
+          },
+        ],
+      });
+      const gpuCountingModule = device.createShaderModule({
+        code: gpuCountingSortWGSL,
+      });
+      const gpuCountingLayout = device.createPipelineLayout({
+        bindGroupLayouts: [this.gpuCountingBindGroupLayout],
+      });
+      this.gpuCountingKeyHistogramPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_counting_key_histogram_pipeline",
+        layout: gpuCountingLayout,
+        compute: {
+          module: gpuCountingModule,
+          entryPoint: "key_histogram",
         },
-        {
-          binding: 7,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "uniform" },
+      });
+      this.gpuCountingBlockPrefixPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_counting_block_prefix_pipeline",
+        layout: gpuCountingLayout,
+        compute: {
+          module: gpuCountingModule,
+          entryPoint: "block_prefix",
         },
-      ],
-    });
-    const gpuRadixModule = device.createShaderModule({
-      code: gpuRadixSortWGSL,
-    });
-    const gpuRadixLayout = device.createPipelineLayout({
-      bindGroupLayouts: [this.gpuRadixBindGroupLayout],
-    });
-    this.gpuRadixKeyPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_radix_key_pipeline",
-      layout: gpuRadixLayout,
-      compute: {
-        module: gpuRadixModule,
-        entryPoint: "make_keys",
-      },
-    });
-    this.gpuRadixHistogramPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_radix_histogram_pipeline",
-      layout: gpuRadixLayout,
-      compute: {
-        module: gpuRadixModule,
-        entryPoint: "histogram",
-      },
-    });
-    this.gpuRadixBucketTotalPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_radix_bucket_total_pipeline",
-      layout: gpuRadixLayout,
-      compute: {
-        module: gpuRadixModule,
-        entryPoint: "bucket_totals",
-      },
-    });
-    this.gpuRadixBucketBasePipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_radix_bucket_base_pipeline",
-      layout: gpuRadixLayout,
-      compute: {
-        module: gpuRadixModule,
-        entryPoint: "bucket_bases",
-      },
-    });
-    this.gpuRadixBlockPrefixPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_radix_block_prefix_pipeline",
-      layout: gpuRadixLayout,
-      compute: {
-        module: gpuRadixModule,
-        entryPoint: "block_prefix",
-      },
-    });
-    this.gpuRadixScatterPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_radix_scatter_pipeline",
-      layout: gpuRadixLayout,
-      compute: {
-        module: gpuRadixModule,
-        entryPoint: "scatter",
-      },
-    });
-    this.gpuRadixExtractPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_radix_extract_pipeline",
-      layout: gpuRadixLayout,
-      compute: {
-        module: gpuRadixModule,
-        entryPoint: "extract_order",
-      },
-    });
-    this.gpuCountingBindGroupLayout = device.createBindGroupLayout({
-      label: "spark_wgsl_gpu_counting_sort_bgl",
-      entries: [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "read-only-storage" },
+      });
+      this.gpuCountingGroupPrefixPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_counting_group_prefix_pipeline",
+        layout: gpuCountingLayout,
+        compute: {
+          module: gpuCountingModule,
+          entryPoint: "group_prefix",
         },
-        {
-          binding: 1,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+      });
+      this.gpuCountingAddGroupBasePipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_counting_add_group_base_pipeline",
+        layout: gpuCountingLayout,
+        compute: {
+          module: gpuCountingModule,
+          entryPoint: "add_group_base",
         },
-        {
-          binding: 2,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
+      });
+      this.gpuCountingScatterPipeline = device.createComputePipeline({
+        label: "spark_wgsl_gpu_counting_scatter_pipeline",
+        layout: gpuCountingLayout,
+        compute: {
+          module: gpuCountingModule,
+          entryPoint: "scatter",
         },
-        {
-          binding: 3,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
-        },
-        {
-          binding: 4,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
-        },
-        {
-          binding: 5,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
-        },
-        {
-          binding: 6,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "uniform" },
-        },
-      ],
-    });
-    const gpuCountingModule = device.createShaderModule({
-      code: gpuCountingSortWGSL,
-    });
-    const gpuCountingLayout = device.createPipelineLayout({
-      bindGroupLayouts: [this.gpuCountingBindGroupLayout],
-    });
-    this.gpuCountingKeyHistogramPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_counting_key_histogram_pipeline",
-      layout: gpuCountingLayout,
-      compute: {
-        module: gpuCountingModule,
-        entryPoint: "key_histogram",
-      },
-    });
-    this.gpuCountingBlockPrefixPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_counting_block_prefix_pipeline",
-      layout: gpuCountingLayout,
-      compute: {
-        module: gpuCountingModule,
-        entryPoint: "block_prefix",
-      },
-    });
-    this.gpuCountingGroupPrefixPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_counting_group_prefix_pipeline",
-      layout: gpuCountingLayout,
-      compute: {
-        module: gpuCountingModule,
-        entryPoint: "group_prefix",
-      },
-    });
-    this.gpuCountingAddGroupBasePipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_counting_add_group_base_pipeline",
-      layout: gpuCountingLayout,
-      compute: {
-        module: gpuCountingModule,
-        entryPoint: "add_group_base",
-      },
-    });
-    this.gpuCountingScatterPipeline = device.createComputePipeline({
-      label: "spark_wgsl_gpu_counting_scatter_pipeline",
-      layout: gpuCountingLayout,
-      compute: {
-        module: gpuCountingModule,
-        entryPoint: "scatter",
-      },
-    });
+      });
+    }
     this.renderPipeline = device.createRenderPipeline({
       label: "spark_wgsl_render_pipeline",
       layout: device.createPipelineLayout({
@@ -1409,7 +1618,7 @@ class DirectWGSLSplatRenderer {
     radixEnabled: boolean,
     debugOnce: boolean,
     timestamp: boolean,
-  ) {
+  ): GPUOrderUpdateResult {
     if (algorithm === "counting") {
       return this.updateOrderGPUCounting(
         positions,
@@ -1438,11 +1647,22 @@ class DirectWGSLSplatRenderer {
         timestamp,
       );
     }
+    if (
+      !this.gpuSortKeyPipeline ||
+      !this.gpuSortPassPipeline ||
+      !this.gpuSortExtractPipeline ||
+      !this.gpuSortBindGroupLayout
+    ) {
+      return { ok: false, reason: "bitonic-pipelines-unavailable" };
+    }
     const count = this.count;
     if (this.chunks.length !== 1 || count > maxSplats) {
       return {
         ok: false,
-        reason: this.chunks.length !== 1 ? "multi-chunk" : "max-splats",
+        reason:
+          this.chunks.length !== 1
+            ? `multi-chunk (${this.chunks.length})`
+            : `max-splats (${count.toLocaleString()} > ${maxSplats.toLocaleString()})`,
       } satisfies GPUOrderUpdateResult;
     }
     const chunk = this.chunks[0];
@@ -1460,7 +1680,7 @@ class DirectWGSLSplatRenderer {
     if (paddedCount > maxSplats) {
       return {
         ok: false,
-        reason: "padded-max-splats",
+        reason: `padded-max-splats (${paddedCount.toLocaleString()} > ${maxSplats.toLocaleString()})`,
       } satisfies GPUOrderUpdateResult;
     }
     const dispatchCount = Math.ceil(paddedCount / gpuSortWorkgroupSize);
@@ -1473,6 +1693,8 @@ class DirectWGSLSplatRenderer {
     const needsNewState =
       !chunk.gpuSort || chunk.gpuSort.paddedCount !== paddedCount;
     if (needsNewState) {
+      destroyGPUSortState(chunk.gpuSort);
+      chunk.gpuSort = undefined;
       const sortState = this.createGPUSortState(
         positions,
         paddedCount,
@@ -1583,11 +1805,26 @@ class DirectWGSLSplatRenderer {
     debugOnce: boolean,
     timestamp: boolean,
   ): GPUOrderUpdateResult {
+    if (
+      !this.gpuRadixBindGroupLayout ||
+      !this.gpuRadixKeyPipeline ||
+      !this.gpuRadixHistogramPipeline ||
+      !this.gpuRadixBucketTotalPipeline ||
+      !this.gpuRadixBucketBasePipeline ||
+      !this.gpuRadixBlockPrefixPipeline ||
+      !this.gpuRadixScatterPipeline ||
+      !this.gpuRadixExtractPipeline
+    ) {
+      return { ok: false, reason: "radix-pipelines-unavailable" };
+    }
     const count = this.count;
     if (this.chunks.length !== 1 || count > maxSplats) {
       return {
         ok: false,
-        reason: this.chunks.length !== 1 ? "multi-chunk" : "max-splats",
+        reason:
+          this.chunks.length !== 1
+            ? `multi-chunk (${this.chunks.length})`
+            : `max-splats (${count.toLocaleString()} > ${maxSplats.toLocaleString()})`,
       };
     }
     if (
@@ -1617,6 +1854,8 @@ class DirectWGSLSplatRenderer {
       chunk.gpuRadixSort.blockCount !== blockCount ||
       chunk.gpuRadixSort.blockGroupCount !== blockGroupCount;
     if (needsNewState) {
+      destroyGPURadixSortState(chunk.gpuRadixSort);
+      chunk.gpuRadixSort = undefined;
       const sortStateResult = this.createGPURadixSortState(
         positions,
         count,
@@ -1799,11 +2038,24 @@ class DirectWGSLSplatRenderer {
     debugOnce: boolean,
     timestamp: boolean,
   ): GPUOrderUpdateResult {
+    if (
+      !this.gpuCountingBindGroupLayout ||
+      !this.gpuCountingKeyHistogramPipeline ||
+      !this.gpuCountingBlockPrefixPipeline ||
+      !this.gpuCountingGroupPrefixPipeline ||
+      !this.gpuCountingAddGroupBasePipeline ||
+      !this.gpuCountingScatterPipeline
+    ) {
+      return { ok: false, reason: "counting-pipelines-unavailable" };
+    }
     const count = this.count;
     if (this.chunks.length !== 1 || count > maxSplats) {
       return {
         ok: false,
-        reason: this.chunks.length !== 1 ? "multi-chunk" : "max-splats",
+        reason:
+          this.chunks.length !== 1
+            ? `multi-chunk (${this.chunks.length})`
+            : `max-splats (${count.toLocaleString()} > ${maxSplats.toLocaleString()})`,
       };
     }
     const bucketCount = clampGPUCountingBucketCount(requestedBucketCount);
@@ -1827,6 +2079,8 @@ class DirectWGSLSplatRenderer {
       chunk.gpuCountingSort.count !== count ||
       chunk.gpuCountingSort.bucketCount !== bucketCount;
     if (needsNewState) {
+      destroyGPUCountingSortState(chunk.gpuCountingSort);
+      chunk.gpuCountingSort = undefined;
       const sortStateResult = this.createGPUCountingSortState(
         positions,
         count,
@@ -1998,7 +2252,10 @@ class DirectWGSLSplatRenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     const bindGroup = this.device.createBindGroup({
-      layout: this.gpuSortBindGroupLayout,
+      layout: requireGPUResource(
+        this.gpuSortBindGroupLayout,
+        "bitonic bind group layout",
+      ),
       entries: [
         { binding: 0, resource: { buffer: positionsBuffer } },
         { binding: 1, resource: { buffer: pairsBuffer } },
@@ -2029,7 +2286,10 @@ class DirectWGSLSplatRenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     const bindGroup = this.device.createBindGroup({
-      layout: this.gpuSortBindGroupLayout,
+      layout: requireGPUResource(
+        this.gpuSortBindGroupLayout,
+        "bitonic bind group layout",
+      ),
       entries: [
         { binding: 0, resource: { buffer: sortState.positionsBuffer } },
         { binding: 1, resource: { buffer: sortState.pairsBuffer } },
@@ -2061,13 +2321,20 @@ class DirectWGSLSplatRenderer {
     target: GPUSortDebugTarget,
   ): GPUSortDebugReadback {
     return {
-      promise: target.readBuffer.mapAsync(GPUMapMode.READ).then(() => {
-        const order = new Uint32Array(
-          target.readBuffer.getMappedRange().slice(0),
-        );
-        target.readBuffer.unmap();
-        return order;
-      }),
+      promise: target.readBuffer
+        .mapAsync(GPUMapMode.READ)
+        .then(() => {
+          const order = new Uint32Array(
+            target.readBuffer.getMappedRange().slice(0),
+          );
+          target.readBuffer.unmap();
+          target.readBuffer.destroy();
+          return order;
+        })
+        .catch((error) => {
+          target.readBuffer.destroy();
+          throw error;
+        }),
     };
   }
 
@@ -2301,7 +2568,10 @@ class DirectWGSLSplatRenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     const bindGroup = this.device.createBindGroup({
-      layout: this.gpuRadixBindGroupLayout,
+      layout: requireGPUResource(
+        this.gpuRadixBindGroupLayout,
+        "radix bind group layout",
+      ),
       entries: [
         { binding: 0, resource: { buffer: positionsBuffer } },
         { binding: 1, resource: { buffer: pairsA } },
@@ -2402,7 +2672,10 @@ class DirectWGSLSplatRenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     const bindGroup = this.device.createBindGroup({
-      layout: this.gpuCountingBindGroupLayout,
+      layout: requireGPUResource(
+        this.gpuCountingBindGroupLayout,
+        "counting bind group layout",
+      ),
       entries: [
         { binding: 0, resource: { buffer: positionsBuffer } },
         { binding: 1, resource: { buffer: keysBuffer } },
@@ -2441,7 +2714,10 @@ class DirectWGSLSplatRenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     const bindGroup = this.device.createBindGroup({
-      layout: this.gpuRadixBindGroupLayout,
+      layout: requireGPUResource(
+        this.gpuRadixBindGroupLayout,
+        "radix bind group layout",
+      ),
       entries: [
         { binding: 0, resource: { buffer: sortState.positionsBuffer } },
         { binding: 1, resource: { buffer: sortState.pairsA } },
@@ -2483,17 +2759,9 @@ class DirectWGSLSplatRenderer {
     this.writeUniformState(camera, object, false);
     this.updateProjectionState();
 
-    if (!force && !this.isRenderStateDirty()) {
+    const projectionDirty = force || this.isRenderStateDirty();
+    if (!projectionDirty) {
       this.skippedStableCount++;
-      return;
-    }
-    if (this.inFlightFrameCount >= maxInFlightFrames) {
-      this.deferredRenderRequested = true;
-      this.skippedBusyCount++;
-      this.skippedBusyRenderCount++;
-      this.lastBusyPass = "render";
-      this.lastBusyDirtyReason = this.lastDirtyReason;
-      return;
     }
     const encoder = this.device.createCommandEncoder({
       label: "spark_wgsl_frame",
@@ -2505,30 +2773,32 @@ class DirectWGSLSplatRenderer {
         ? this.resetTimestampState()
         : null;
     const orderSlot = this.frontOrderSlot;
-    for (const chunk of this.chunks) {
-      this.uniformData[34] = chunk.drawCounts[orderSlot];
-      this.uniformData[40] = chunk.textureWidth;
-      this.uniformData[41] = chunk.base;
-      this.uniformData[42] = this.options.highPrecisionProjected ? 1 : 0;
-      this.device.queue.writeBuffer(chunk.uniformBuffer, 0, this.uniformData);
-    }
-
-    const projectPass = encoder.beginComputePass(
-      this.timestampPassDescriptor(timestampState, "spark_wgsl_project"),
-    );
-    projectPass.setPipeline(this.projectPipeline);
     let projectDispatches = 0;
-    for (const chunk of this.chunks) {
-      if (chunk.drawCounts[orderSlot] === 0) {
-        continue;
+    if (projectionDirty) {
+      for (const chunk of this.chunks) {
+        this.uniformData[34] = chunk.drawCounts[orderSlot];
+        this.uniformData[40] = chunk.textureWidth;
+        this.uniformData[41] = chunk.base;
+        this.uniformData[42] = this.options.highPrecisionProjected ? 1 : 0;
+        this.device.queue.writeBuffer(chunk.uniformBuffer, 0, this.uniformData);
       }
-      projectPass.setBindGroup(0, chunk.projectBindGroups[orderSlot]);
-      projectPass.dispatchWorkgroups(
-        Math.ceil(chunk.drawCounts[orderSlot] / projectWorkgroupSize),
+
+      const projectPass = encoder.beginComputePass(
+        this.timestampPassDescriptor(timestampState, "spark_wgsl_project"),
       );
-      projectDispatches++;
+      projectPass.setPipeline(this.projectPipeline);
+      for (const chunk of this.chunks) {
+        if (chunk.drawCounts[orderSlot] === 0) {
+          continue;
+        }
+        projectPass.setBindGroup(0, chunk.projectBindGroups[orderSlot]);
+        projectPass.dispatchWorkgroups(
+          Math.ceil(chunk.drawCounts[orderSlot] / projectWorkgroupSize),
+        );
+        projectDispatches++;
+      }
+      projectPass.end();
     }
-    projectPass.end();
 
     renderer.getClearColor?.(this.clearColor);
     const renderPass = encoder.beginRenderPass(
@@ -2566,7 +2836,9 @@ class DirectWGSLSplatRenderer {
       drawSplats += chunk.drawCounts[orderSlot];
     }
     renderPass.end();
-    this.lastSubmittedPass = "render";
+    this.lastSubmittedPass = projectionDirty
+      ? "project+render"
+      : "render-reuse";
     this.lastSubmittedProjectDispatches = projectDispatches;
     this.lastSubmittedDrawCalls = drawCalls;
     this.lastSubmittedDrawSplats = drawSplats;
@@ -2836,6 +3108,30 @@ class DirectWGSLSplatRenderer {
   private updateProjectionState() {
     this.projectionState.set(this.uniformData.subarray(16, 34), 0);
   }
+
+  dispose() {
+    for (const chunk of this.chunks) {
+      chunk.splatTexture.destroy();
+      chunk.sh1Texture.destroy();
+      chunk.sh2Texture.destroy();
+      chunk.sh3Texture.destroy();
+      for (const texture of chunk.orderTextures) texture.destroy();
+      chunk.projectedBuffer.destroy();
+      chunk.projectedColorOpacityBuffer.destroy();
+      chunk.projectedCenterOpacityBuffer.destroy();
+      chunk.projectedAxesBuffer.destroy();
+      chunk.uniformBuffer.destroy();
+      destroyGPUSortState(chunk.gpuSort);
+      destroyGPURadixSortState(chunk.gpuRadixSort);
+      destroyGPUCountingSortState(chunk.gpuCountingSort);
+    }
+    this.quadVertexBuffer.destroy();
+    this.quadIndexBuffer.destroy();
+    this.timestampState?.querySet.destroy();
+    this.timestampState?.resolveBuffer.destroy();
+    this.timestampState?.readBuffer.destroy();
+    this.timestampState = null;
+  }
 }
 
 function createSplatChunks({
@@ -2854,7 +3150,23 @@ function createSplatChunks({
   const wordsPerSplat = 4;
   const maxTextureDimension2D = device.limits?.maxTextureDimension2D ?? 8192;
   const textureWidth = Math.min(4096, maxTextureDimension2D);
-  const maxSplatsPerChunk = textureWidth * maxTextureDimension2D;
+  const maxStorageBufferBindingSize = Math.min(
+    device.limits.maxStorageBufferBindingSize,
+    device.limits.maxBufferSize,
+  );
+  const maxSplatsPerStorageBuffer = Math.floor(
+    maxStorageBufferBindingSize / projectedBytesPerSplat,
+  );
+  const maxSplatsPerDispatch =
+    device.limits.maxComputeWorkgroupsPerDimension * projectWorkgroupSize;
+  const maxSplatsPerChunk = Math.min(
+    textureWidth * maxTextureDimension2D,
+    maxSplatsPerStorageBuffer,
+    maxSplatsPerDispatch,
+  );
+  if (maxSplatsPerChunk < 1) {
+    throw new Error("WebGPU device limits cannot fit a Spark splat chunk");
+  }
   const packedArray = packedSplats.packedArray;
   if (!packedArray) {
     throw new Error("PackedSplats is not initialized");
@@ -3197,6 +3509,49 @@ const batchedQuadIndexCount = batchedQuadSplatCount * 6;
 const defaultRenderStateMatrixEpsilon = 1e-3;
 const renderStateScalarEpsilon = 1e-6;
 const maxInFlightFrames = 2;
+const projectedBytesPerSplat = 4 * Uint32Array.BYTES_PER_ELEMENT;
+
+function requireGPUResource<T>(resource: T | undefined, label: string): T {
+  if (!resource) throw new Error(`Missing WebGPU ${label}`);
+  return resource;
+}
+
+function destroyGPUSortState(state?: GPUSortState) {
+  if (!state) return;
+  state.positionsBuffer.destroy();
+  state.pairsBuffer.destroy();
+  state.orderBuffer.destroy();
+  state.uniformBuffer.destroy();
+  for (const { uniformBuffer } of state.passStates.values()) {
+    uniformBuffer.destroy();
+  }
+}
+
+function destroyGPURadixSortState(state?: GPURadixSortState) {
+  if (!state) return;
+  state.positionsBuffer.destroy();
+  state.pairsA.destroy();
+  state.pairsB.destroy();
+  state.orderBuffer.destroy();
+  state.histogramBuffer.destroy();
+  state.bucketPrefixBuffer.destroy();
+  state.prefixBuffer.destroy();
+  state.uniformBuffer.destroy();
+  for (const { uniformBuffer } of state.passStates.values()) {
+    uniformBuffer.destroy();
+  }
+}
+
+function destroyGPUCountingSortState(state?: GPUCountingSortState) {
+  if (!state) return;
+  state.positionsBuffer.destroy();
+  state.keysBuffer.destroy();
+  state.orderBuffer.destroy();
+  state.histogramBuffer.destroy();
+  state.offsetsBuffer.destroy();
+  state.groupTotalsBuffer.destroy();
+  state.uniformBuffer.destroy();
+}
 
 function clampGPUSortBucketBits(value: number) {
   if (!Number.isFinite(value)) {
@@ -3213,35 +3568,6 @@ function clampGPUSortBucketBits(value: number) {
     return 24;
   }
   return 32;
-}
-
-function clampGPUCountingBucketCount(value: number) {
-  if (!Number.isFinite(value)) {
-    return 131072;
-  }
-  const bucketCount = Math.floor(value);
-  if (bucketCount <= 1024) {
-    return 1024;
-  }
-  if (bucketCount <= 2048) {
-    return 2048;
-  }
-  if (bucketCount <= 4096) {
-    return 4096;
-  }
-  if (bucketCount <= 8192) {
-    return 8192;
-  }
-  if (bucketCount <= 16384) {
-    return 16384;
-  }
-  if (bucketCount <= 32768) {
-    return 32768;
-  }
-  if (bucketCount <= 65536) {
-    return 65536;
-  }
-  return 131072;
 }
 
 function cloneCameraState(camera: THREE.Camera) {

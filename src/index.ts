@@ -3,6 +3,18 @@ export {
   type SparkRendererOptions,
 } from "./SparkRenderer";
 export {
+  SparkBackend,
+  createSparkRenderer,
+  getSparkWebGPUProfile,
+  type CreateSparkRendererOptions,
+  type CreateSparkSplatOptions,
+  type SparkBackendKind,
+  type SparkBackendPreference,
+  type SparkRendererInstance,
+  type SparkSplatMesh,
+  type SparkWebGPUProfileOptions,
+} from "./SparkBackend";
+export {
   SparkWebGPUBackend,
   type SparkWebGPURendererParameters,
 } from "./backends/webgpu/SparkWebGPUBackend";
@@ -11,7 +23,12 @@ export {
   type CreateWebGPUWGSLSplatOptions,
 } from "./backends/webgpu/wgslSplats";
 export { createSparkWebGPUBackend } from "./backends/webgpu/create";
-export { isWebGPUAvailable } from "./backends/webgpu/capabilities";
+export {
+  getWebGPUCapabilityReport,
+  isWebGPUAvailable,
+  isWebGPUSupported,
+  type WebGPUCapabilityReport,
+} from "./backends/webgpu/capabilities";
 export { SplatAccumulator, type GeneratorMapping } from "./SplatAccumulator";
 
 export * as dyno from "./dyno";
